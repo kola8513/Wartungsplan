@@ -319,6 +319,11 @@ create_initial_table <- function(device_id = NULL) {
     rows <- rbind(rows, mk_row(header = "Montag", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Drogentest-Kontrolle positiv/negativ im Wechsel"))
     
+    # Lower headers (separate headers at the bottom)
+    rows <- rbind(rows, mk_row(header = "PFA (SN 00398)", task = ""))
+    rows <- rbind(rows, mk_row(header = "MC1", task = ""))
+    rows <- rbind(rows, mk_row(header = "Multiplate  (SN 310071)", task = ""))
+    
     # Ensure column order: Header, Task, 1..31
     rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
     return(rows)
