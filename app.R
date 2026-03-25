@@ -1,4 +1,3 @@
-
 options(encoding = "UTF-8")
 
 # ---- packages ----
@@ -84,6 +83,10 @@ ensure_schema <- function() {
       label     TEXT NOT NULL
     );
   ")
+
+dbExecute(con, "ALTER TABLE device_layout ADD COLUMN IF NOT EXISTS version TEXT;")
+dbExecute(con, "ALTER TABLE device_layout ADD COLUMN IF NOT EXISTS valid_from DATE;")
+
   
   # Base grids (no working cols)
   dbExecute(con, "
@@ -122,10 +125,40 @@ ensure_schema <- function() {
   ")
   dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cell_status_device ON device_cell_status(device_id);")
   
+  # Per-device layout table: footer and title for each device (store file path relative to www/)
+  dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS device_layout (
+      device_id   TEXT PRIMARY KEY REFERENCES devices(device_id),
+      title       TEXT,
+      footer_text TEXT,
+      footer_path TEXT,   -- relative path under www/, e.g. 'uploads/g1-footer-20251029.png'
+      footer_mime TEXT,
+      updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_by  TEXT
+    );
+  ")
+  
+  # App-level images (for hub/übersicht header) - optional; you upload manually to www/uploads and set path if needed
+  dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS app_images (
+      id         TEXT PRIMARY KEY,
+      img_path   TEXT,
+      img_mime   TEXT,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_by TEXT
+    );
+  ")
+  # ensure default row for hub header exists (can be NULL path)
+  dbExecute(con, "
+    INSERT INTO app_images (id, img_path)
+    VALUES ('hub_header', NULL)
+    ON CONFLICT (id) DO NOTHING;
+  ")
+  
   # Seed devices (upsert so labels are applied/updated)
   dbExecute(con, "
     INSERT INTO devices (device_id, label) VALUES
-      ('g1', 'PFA /Cobas 411/ Multiplate, MC1'),
+      ('g1', 'PFA,Cobas 411, Multiplate, MC1'),
       ('g2', 'Euroimmun Analyzer I'),
       ('g3', 'Cobas 8100'),
       ('g4', 'COBAS Pro I'),
@@ -145,14 +178,92 @@ ensure_schema <- function() {
   ")
 }
 
+# Helper functions for password reset
+safe_equal <- function(a, b) {
+  if (is.null(a) || is.null(b)) return(FALSE)
+  identical(a, b)
+}
+
+force_reset_db <- function(con, username) {
+  DBI::dbExecute(con, "UPDATE app_users SET must_reset = TRUE, password_hash = NULL WHERE username = $1", 
+                 params = list(username))
+}
+
+# Helper to load device layout (includes footer text/path and timestamps)
+load_device_layout <- function(con, device_id) {
+  res <- DBI::dbGetQuery(con, "
+    SELECT title, footer_text, footer_path, footer_mime, updated_at, updated_by,
+           version, valid_from
+    FROM device_layout
+    WHERE device_id = $1
+  ", params = list(device_id))
+  if (nrow(res) == 0) {
+    return(list(title=NULL, footer_text=NULL, footer_path=NULL, footer_mime=NULL,
+                updated_at=NULL, updated_by=NULL, version=NULL, valid_from=NULL))
+  }
+  list(
+    title       = res$title[1],
+    footer_text = res$footer_text[1],
+    footer_path = res$footer_path[1],
+    footer_mime = res$footer_mime[1],
+    updated_at  = res$updated_at[1],
+    updated_by  = res$updated_by[1],
+    version     = res$version[1],
+    valid_from  = res$valid_from[1]
+  )
+}
+
+
+# Helper to save device layout (upsert)
+save_device_layout <- function(con, device_id, title=NULL, footer_text=NULL,
+                               footer_path=NULL, footer_mime=NULL, who=NULL,
+                               version=NULL, valid_from=NULL) {
+  DBI::dbExecute(con, "
+    INSERT INTO device_layout (device_id, title, footer_text, footer_path, footer_mime, updated_at, updated_by, version, valid_from)
+    VALUES ($1,$2,$3,$4,$5,NOW(),$6,$7,$8)
+    ON CONFLICT (device_id) DO UPDATE
+      SET title       = COALESCE(EXCLUDED.title,       device_layout.title),
+          footer_text = COALESCE(EXCLUDED.footer_text, device_layout.footer_text),
+          footer_path = COALESCE(EXCLUDED.footer_path, device_layout.footer_path),
+          footer_mime = COALESCE(EXCLUDED.footer_mime, device_layout.footer_mime),
+          version     = COALESCE(EXCLUDED.version,     device_layout.version),
+          valid_from  = COALESCE(EXCLUDED.valid_from,  device_layout.valid_from),
+          updated_at  = NOW(),
+          updated_by  = EXCLUDED.updated_by
+  ", params = list(device_id, title, footer_text, footer_path, footer_mime, who, version, valid_from))
+}
+
+
+# Helpers for app-level images (hub header)
+load_app_image <- function(con, id = "hub_header") {
+  res <- DBI::dbGetQuery(con, "SELECT img_path, img_mime FROM app_images WHERE id = $1", params = list(id))
+  if (nrow(res) == 0) return(list(img_path = NULL, img_mime = NULL))
+  list(img_path = res$img_path[1], img_mime = res$img_mime[1])
+}
+save_app_image <- function(con, id = "hub_header", img_path = NULL, img_mime = NULL, who = NULL) {
+  DBI::dbExecute(con, "
+    INSERT INTO app_images (id, img_path, img_mime, updated_at, updated_by)
+    VALUES ($1, $2, $3, NOW(), $4)
+    ON CONFLICT (id) DO UPDATE
+      SET img_path = COALESCE(EXCLUDED.img_path, app_images.img_path),
+          img_mime = COALESCE(EXCLUDED.img_mime, app_images.img_mime),
+          updated_at = NOW(),
+          updated_by = EXCLUDED.updated_by
+  ", params = list(id, img_path, img_mime, who))
+}
+
 # =================== Helpers ===================
 # Helper: compute invalid days for selected month/year
 calc_invalid_days <- function(year, month) {
-  start <- as.Date(sprintf("%04d-%02d-01", year, month))
-  nextm <- if (month == 12) as.Date(sprintf("%04d-01-01", year + 1))
-  else as.Date(sprintf("%04d-%02d-01", year, month + 1))
-  dim <- as.integer(format(nextm - 1, "%d"))
-  setdiff(1:31, 1:dim)
+  # Calculate the number of days in the month
+  if (month == 12) {
+    next_month_start <- as.Date(sprintf("%04d-01-01", year + 1))
+  } else {
+    next_month_start <- as.Date(sprintf("%04d-%02d-01", year, month + 1))
+  }
+  current_month_start <- as.Date(sprintf("%04d-%02d-01", year, month))
+  days_in_month <- as.integer(next_month_start - current_month_start)
+  setdiff(1:31, 1:days_in_month)
 }
 
 # ---- Device-specific template ----
@@ -170,7 +281,7 @@ create_initial_table <- function(device_id = NULL) {
     tmp
   }
   
-  # Default builder for other devices (unchanged)
+  # Default builder for other devices
   default_builder <- function(headers, row_counts) {
     rows <- NULL
     for (i in seq_along(headers)) {
@@ -235,6 +346,11 @@ order_cols <- function(df) {
   other    <- setdiff(names(df), c(front, day_cols))
   df[, c(front, day_cols, other), drop = FALSE]
 }
+
+# Define task option tokens globally so all server functions can use them
+TASK_OPTIONS <- c("WE (Wochenende)", "FT (Feiertag)", "Ø (An diesem Tag wurden keine Analysen gestartet)", 
+                  "W.e. (Wartungspunkt ist in einer größeren Wartung enthalten)", "ne (Nicht erforderlich (für die Rubrik „ bei Bedarf“))", 
+                  "D (Gerät / Modul defekt)", "sB (Siehe Bemerkungen)", "sQ (Siehe Quasi)")
 
 # ---- Base grid JSON (load/save) ----
 load_device_table <- function(con, device_id) {
@@ -415,6 +531,7 @@ delete_cell_if_owner <- function(con, device_id, row_index, day, who, is_admin =
 build_overlayed_table <- function(df, cell_status_df) {
   out <- df
   if (!nrow(cell_status_df)) return(order_cols(out))
+  
   for (i in seq_len(nrow(cell_status_df))) {
     r <- cell_status_df$row_index[i]
     d <- as.character(cell_status_df$day[i])
@@ -422,30 +539,63 @@ build_overlayed_table <- function(df, cell_status_df) {
       out[r, d] <- cell_status_df$value_text[i]
     }
   }
+  
+  # Clean up data for PDF export - remove empty columns and ensure proper encoding
+  # Replace any problematic characters
+  out[] <- lapply(out, function(x) {
+    if (is.character(x)) {
+      # Convert to UTF-8 and replace problematic characters
+      x <- iconv(x, to = "UTF-8", sub = "")
+      # Replace checkmarks with simpler character if needed
+      x <- gsub("\u2713", "X", x)  # Replace checkmark with X
+      return(x)
+    }
+    return(x)
+  })
+  
   order_cols(out)
 }
 
 # ---- Handsontable renderer (per-cell locking) ----
-cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df, role = "user", invalid_days = integer()) {
+cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df,
+                                       role = "user", invalid_days = integer()) {
   df_show <- overlay_for_render(df, cell_status_df)
-  
-  rh <- rhandsontable(df_show) %>%
+
+  rh <- rhandsontable(df_show, stretchH = "all") %>%
+    # Make Header column yellow if not empty
+    hot_col(
+      "Header",
+      readOnly = TRUE,
+      renderer = htmlwidgets::JS("
+        function (instance, td, row, col, prop, value, cellProperties) {
+          Handsontable.renderers.TextRenderer.apply(this, arguments);
+          if (value && String(value).trim().length > 0) {
+            td.style.background = '#fff7b2';  // nice yellow
+            td.style.fontWeight = 'bold';
+          } else {
+            td.style.background = '#ffffff';  // plain white for blank rows
+          }
+        }
+      ")
+    ) %>%
     hot_cols(columnSorting = TRUE, manualColumnResize = TRUE) %>%
     hot_table(highlightCol = TRUE, highlightRow = TRUE, rowHeaders = FALSE, comments = TRUE)
-  
-  # lock header rows entirely (also lock Task column for header rows)
+
+
+  # Keep the rest: lock header ROWS for Task/day cells if you want them uneditable
   header_rows <- which(df_show$Header != "")
   if (length(header_rows)) {
     for (r in header_rows) {
-      rh <- rh %>% hot_cell(r - 1, "Header", readOnly = TRUE)
+      # Task column (keep readOnly but no yellow)
       if ("Task" %in% names(df_show)) rh <- rh %>% hot_cell(r - 1, "Task", readOnly = TRUE)
+      # Day columns 1..31 (keep readOnly but no yellow)
       for (d in as.character(1:31)) {
         if (d %in% names(df_show)) rh <- rh %>% hot_cell(r - 1, d, readOnly = TRUE)
       }
     }
   }
-  
-  # lock invalid days (by month/year selection)
+
+  # lock invalid days (unchanged)
   if (length(invalid_days)) {
     for (d in as.character(invalid_days)) {
       if (d %in% names(df_show)) {
@@ -455,8 +605,8 @@ cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df
       }
     }
   }
-  
-  # add per-cell locks + comments
+
+  # per-cell locks + comments (unchanged)
   if (!missing(cell_status_df) && nrow(cell_status_df)) {
     for (i in seq_len(nrow(cell_status_df))) {
       rr  <- cell_status_df$row_index[i]
@@ -465,17 +615,17 @@ cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df
       if (!(dd %in% names(df_show))) next
       if (rr < 1 || rr > nrow(df_show)) next
       if (df_show$Header[rr] != "") next
-      
       if (!identical(who, current_user_initials) && role != "admin") {
         rh <- rh %>% hot_cell(rr - 1, dd, readOnly = TRUE)
       }
-      
       when <- format(as.POSIXct(cell_status_df$updated_at[i], tz = "Europe/Berlin"), "%Y-%m-%d %H:%M %Z")
       rh <- rh %>% hot_cell(rr - 1, dd, comment = sprintf("von %s · %s", who, when))
     }
   }
+
   rh
 }
+
 
 # Overlay helper used above
 overlay_for_render <- function(df, cell_status_df) {
@@ -497,22 +647,41 @@ header <- dashboardHeader(title = "Wartungsplan")
 sidebar <- dashboardSidebar(
   sidebarMenu(id = "tabs",
               menuItem("Übersicht", tabName = "hub", icon = icon("th-large")),
-              menuItem("Checkliste", tabName = "checklist", icon = icon("tasks"))
+              menuItem("Checkliste", tabName = "checklist", icon = icon("tasks")),
+              menuItem("Kopf-Fuß Zeile ändern", tabName = "layout", icon = icon("images"))
   )
 )
 
 body <- dashboardBody(
   useShinyjs(),
   use_theme(apptheme),
-  tags$style(HTML(sprintf("
-    .btn.btn-primary { color: #fff !important; }
-    .btn.btn-primary{ background:%1$s; border-color:%1$s; }
-    .btn.btn-primary:hover{ filter:brightness(0.9); }
-    .badge{ background:%1$s; }
-    h1,h2,h3,h4{ color:%1$s; }
-  ", DARK_BLUE))),
+    tags$style(HTML(sprintf("
+      .btn.btn-primary { color: #fff !important; }
+      .btn.btn-primary{ background:%1$s; border-color:%1$s; }
+      .btn.btn-primary:hover{ filter:brightness(0.9); }
+      .badge{ background:%1$s; }
+      h1,h2,h3,h4{ color:%1$s; }
+
+      /* yellow highlight for header rows in the handsontable */
+      .header-yellow {
+        background-color: #fff7b2 !important;  /* soft yellow */
+        font-weight: 600;
+      }
+
+      .handsontable td.htYellowHeader {
+  background-color: #fff7b2 !important;  /* soft yellow */
+  font-weight: 700 !important;
+}
+
+
+      /* small responsive tweak for header/footer images */
+      .app-header, .app-footer { text-align:center; padding:8px 0; background: #ffffff; }
+      .app-header img, .app-footer img { max-height:100px; display:inline-block; margin:4px; }
+    ", DARK_BLUE))),
+
   conditionalPanel(
     condition = "!output.is_authed",
+
     fluidRow(column(6, offset = 3,
                     box(width = 12, title = "Anmeldung", status = "primary", solidHeader = TRUE,
                         textInput("login_user", "Benutzername"),
@@ -523,29 +692,36 @@ body <- dashboardBody(
                         helpText("Hinweis: Bei der ersten Anmeldung lassen Sie das Passwort frei und klicken Sie auf 'Einloggen' – dann können Sie eines festlegen.")
                     ),
                     uiOutput("password_setup_panel")
-    ))
+    )),
+    
   ),
   conditionalPanel(
     condition = "output.is_authed",
     tabItems(
       tabItem(tabName = "hub",
+              uiOutput("hub_header_image"),
               h3("Diagnostikzentrum"),
               h4("Universitätsinstitut für Klinische Chemie und Laboratoriumsmedizin"),
               br(),
-              uiOutput("hub_buttons")
+              uiOutput("hub_buttons"),
+              br(),br(),
+              uiOutput("hub_table_area")
+
+
       ),
       tabItem(tabName = "checklist",
               uiOutput("device_title"),
               br(),
               fluidRow(
+                # LEFT column made wider (was 4) -> now 5 to give more space for tasks
                 column(
-                  width = 4,
+                  width = 5,
                   box(width = 12, title = "Heutige Aufgaben (Heute)", status = "primary", solidHeader = TRUE,
                       uiOutput("today_tasks")
                   ),
                   box(width = 12, title = "Aktionen", status = "primary", solidHeader = TRUE,
                       selectInput("section", "Reihe unter Abschnitt hinzufügen:",
-                                  choices = c("Täglich", "Wöchentlich", "14-tägig", "Monatlich", "Bei Bedarf")),
+                                  choices = c("Täglich", "Wöchentlich", "Monatlich", "Quartalsweise", "Bei Bedarf")),
                       actionButton("add_row", "Reihe hinzufügen", class = "btn btn-primary"),
                       br(), br(),
                       fluidRow(
@@ -557,20 +733,70 @@ body <- dashboardBody(
                           selected = as.integer(format(Sys.Date(), "%Y"))
                         ))
                       ),
-                      actionButton("mark_today", "Heute abhaken ✓", class = "btn btn-primary"),
-                      br(), br(),
-                      actionButton("save_db", "In DB speichern", class = "btn btn-primary"),
-                      br(), br(),
-                      downloadButton("download_table_csv", "CSV herunterladen"),
-                      downloadButton("download_table_pdf", "PDF herunterladen")
+                      actionButton("mark_today", "Heute abhaken ✓", class = "btn btn-primary")
+
                   )
                 ),
                 column(
-                  width = 8,
+                  width = 7,
+                  div(style = "text-align: right; margin-bottom: 15px;",
+                      downloadButton("download_table_pdf", "📄 PDF herunterladen", 
+                                   class = "btn btn-success", 
+                                   style = "background: linear-gradient(45deg, #28a745, #20c997); border: none; color: white; font-weight: bold; padding: 10px 20px; border-radius: 8px; box-shadow: 0 4px 8px rgba(0,0,0,0.2);")),
                   box(width = 12, title = "Checkliste", status = "primary", solidHeader = TRUE,
                       uiOutput("pending_alert"),
-                      rHandsontableOutput("tableRH")
+                      rHandsontableOutput("tableRH"),
+                      br(),
+                      # Editable per-device information box: placed below the table and above the legend
+                      uiOutput("device_info_area"),
+                      # device-specific footer area will be rendered below the info area if present
+                      uiOutput("device_footer_ui"),
+                  box(
+                    width = 12, title = "Legende", status = "primary", solidHeader = TRUE,
+                    div(style = "display:flex; justify-content:flex-end;",
+                        tags$table(class = "table table-condensed", style = "width:auto; max-width:320px; margin:0;",
+                                  tags$tbody(
+                                    tags$tr(tags$td(strong("Legende"), colspan = 2)),
+                                    tags$tr(tags$td(strong("WE")), tags$td("Wochenende")),
+                                    tags$tr(tags$td(strong("FT")), tags$td("Feiertag")),
+                                    tags$tr(tags$td(strong("Ø")), tags$td("An diesem Tag wurden keine Analysen gestartet")),
+                                    tags$tr(tags$td(strong("W.e.")), tags$td("Wartungspunkt ist in einer größeren Wartung enthalten")),
+                                    tags$tr(tags$td(strong("ne")), tags$td("Nicht erforderlich (für die Rubrik „bei Bedarf“)")),
+                                    tags$tr(tags$td(strong("D")), tags$td("Gerät / Modul defekt")),
+                                    tags$tr(tags$td(strong("sB")), tags$td("Siehe Bemerkungen")),
+                                    tags$tr(tags$td(strong("sQ")), tags$td("Siehe Quasi"))
+                                  )
+                        )
+                    )
                   )
+                  )
+                )
+              )
+      ),
+      tabItem(tabName = "layout",
+              h3("Kopf- / Fußzeile ändern"),
+              fluidRow(
+                column(width = 6,
+                       box(width = 12, title = "Gerätespezifische Fußzeile (Admin)", status = "primary", solidHeader = TRUE,
+                           selectInput("layout_device", "Gerät wählen:", choices = NULL),
+                           textInput("layout_title", "Gerätetitel (wird in Checkliste angezeigt)"),
+                           textInput("layout_footer_text", "Fußzeilentext"),
+                           textInput("layout_version", "Version"),
+                           dateInput("layout_valid_from", "Gültig ab", format = "yyyy-mm-dd"),
+                           helpText("Hinweis: Bilder können manuell in www/uploads/ abgelegt werden. Der Pfad (z. B. 'uploads/g1-footer.png') kann in der DB gesetzt, ansonsten wird nur der Text verwendet.")
+                       )
+                ),
+                column(width = 6,
+                       box(width = 12, title = "Übersicht Header (global)", status = "primary", solidHeader = TRUE,
+                           helpText("Sie können ein Bild manuell in www/uploads/ ablegen und den Pfad in der DB unter app_images (id='hub_header') setzen, falls gewünscht.")
+                       ),
+                       # save controls for admin
+                       uiOutput("layout_save_controls")
+                )
+              ),
+              fluidRow(
+                column(width = 12,
+                       helpText("Hinweis: Bilder werden nicht über die App hochgeladen. Legen Sie stattdessen eine Datei in www/uploads/ ab und verwenden Sie z. B. pgAdmin/psql, um app_images oder device_layout.footer_path zu setzen, oder nutzen Sie die Admin-Speicherfelder oben.")
                 )
               )
       ),
@@ -594,13 +820,22 @@ server <- function(input, output, session) {
     user_initials = NULL,
     must_reset = TRUE,
     current_device = NULL,
+    current_device_title = NULL,
     data = NULL,
     table_status = data.frame(),
     invalid_days = integer(),
     task_obs_ids = character(0)
   )
   
-  output$is_authed <- reactive({ rv$authed })
+  # Ensure upload directory exists (www/uploads) so you can place images there manually
+  if (!dir.exists(file.path("www", "uploads"))) dir.create(file.path("www", "uploads"), recursive = TRUE, showWarnings = FALSE)
+  
+  # Update the is_authed output to respect bypass_auth
+  output$is_authed <- reactive({
+    rv$authed || bypass_auth  # Allow access if authenticated or bypass is enabled
+  })
+  
+  # Ensure the reactive value is registered
   outputOptions(output, "is_authed", suspendWhenHidden = FALSE)
   
   # --- Login flow ---
@@ -687,6 +922,64 @@ server <- function(input, output, session) {
     showNotification("Zurückgesetzt. Beim nächsten Login wird ein neues Passwort verlangt.", type = "message")
   })
   
+  # Add a bypass mode for testing purposes
+  bypass_auth <- FALSE  # Set to TRUE to skip login, FALSE for normal behavior
+  
+  # ---- Overview (hub) header image render ----
+  output$hub_header_image <- renderUI({
+    # read global hub header image path from DB
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    l <- load_app_image(con, id = "hub_header")
+    if (!is.null(l$img_path) && nzchar(l$img_path)) {
+      # img_path is relative to www/ (e.g. 'uploads/hub-20251029.png')
+      tags$div(class = "app-header", tags$img(src = l$img_path, alt = "Hub Header"))
+    } else {
+      return(NULL)
+    }
+  })
+  
+  # ---- Layout tab: populate device selector choices ----
+  observe({
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    devices <- DBI::dbGetQuery(con, "SELECT device_id, label FROM devices ORDER BY device_id")
+    if (nrow(devices)) {
+      choices <- setNames(devices$device_id, devices$label)
+      updateSelectInput(session, "layout_device", choices = choices, selected = devices$device_id[1])
+    }
+  })
+  
+  # Provide layout save controls only for admins (for the layout tab)
+  output$layout_save_controls <- renderUI({
+    if (is.null(rv$role) || rv$role != "admin") {
+      div(class = "alert alert-info", "Nur Admins können hier Layout-Metadaten ändern.")
+    } else {
+      actionButton("save_layout", "Speichern (Admin)", class = "btn btn-primary")
+    }
+  })
+  
+  # ---- Save layout (admin-only) - note: we do not provide image upload in-app; images are expected to be placed in www/uploads/ manually ----
+  observeEvent(input$save_layout, {
+    req(rv$authed)
+    if (is.null(rv$role) || rv$role != "admin") {
+      showNotification("Nur Admins können Layouts speichern.", type = "error"); return()
+    }
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    who <- rv$user %||% "system"
+    if (!is.null(input$layout_device)) {
+      did <- input$layout_device
+      title <- if (!is.null(input$layout_title) && nzchar(input$layout_title)) input$layout_title else NULL
+      footer_text <- if (!is.null(input$layout_footer_text) && nzchar(input$layout_footer_text)) input$layout_footer_text else NULL
+      # Note: version and valid_from fields removed as they're not currently used
+      save_device_layout(con, did,
+                         title = title,
+                         footer_text = footer_text,
+                         footer_path = NULL,
+                         footer_mime = NULL,
+                         who = who)
+      showNotification("Geräte-Metadaten gespeichert.", type = "message")
+    }
+  })
+  
   # ---- Übersicht (hub) ----
   count_open_today <- function(con, device_id, df) {
     if (is.null(df) || !nrow(df)) return(0L)
@@ -711,9 +1004,11 @@ server <- function(input, output, session) {
         lbl <- devices$label[i]
         df_tmp <- load_device_table(con, did) %||% create_initial_table(did)
         open_count <- tryCatch(count_open_today(con, did, df_tmp), error = function(e) 0L)
+
+        # Note: version and valid_from display removed as they're not currently used
         
         # Wrap button in a div to get spacing; make button full-width
-        div(style = "margin-bottom:8px;",
+        div(style = "margin-bottom:8px; width:50%;",
             actionButton(
               inputId = paste0("open_", did),
               label = tagList(
@@ -745,7 +1040,8 @@ server <- function(input, output, session) {
     rv$invalid_days <- calc_invalid_days(year, month)
     
     output$tableRH <- renderRHandsontable({
-      cells_readonly_for_headers(rv$data, rv$user_initials, rv$table_status, rv$role, rv$invalid_days)
+      cells_readonly_for_headers(rv$data) %>% 
+        { cells_readonly_for_headers(rv$data, rv$user_initials, rv$table_status, rv$role, rv$invalid_days) }
     })
   }, ignoreInit = FALSE)
   
@@ -769,19 +1065,87 @@ server <- function(input, output, session) {
     rv$table_status <- status
     rv$task_obs_ids <- character(0)
     
+    # load device title (if set) for display
+    dl <- load_device_layout(con, did)
+    rv$current_device_title <- dl$title
+    
     updateTabItems(session, "tabs", "checklist")
     output$tableRH <- renderRHandsontable({
       cells_readonly_for_headers(rv$data, rv$user_initials, rv$table_status, rv$role, rv$invalid_days)
     })
+    
+    # Render the device info area (editable by any authenticated user)
+    output$device_info_area <- renderUI({
+      req(rv$current_device)
+      con2 <- pg_con(); on.exit(dbDisconnect(con2), add = TRUE)
+      dl2 <- load_device_layout(con2, rv$current_device)
+      # show current footer text (if any), allow editing by all authenticated users
+      box(
+        width = 12, title = "Geräte-Informationen (editable)", status = "primary", solidHeader = TRUE,
+        if (!is.null(dl2$footer_path) && nzchar(dl2$footer_path)) {
+          tagList(
+            tags$div("Hinweis: Ein Gerätebild ist hinterlegt und wird unten angezeigt (manuelles Upload in www/uploads/)."),
+            tags$div(tags$img(src = dl2$footer_path, style = "max-height:120px;"))
+          )
+        } else NULL,
+        textAreaInput("device_info_text", "Informationen zum Gerät (sichtbar für alle):", value = dl2$footer_text %||% "", rows = 4),
+        actionButton("save_device_info", "Speichern", class = "btn btn-primary"),
+        if (!is.null(dl2$updated_at)) tags$small(sprintf(" Letzte Änderung: %s von %s", format(as.POSIXct(dl2$updated_at, tz = "UTC"), "%Y-%m-%d %H:%M"), dl2$updated_by)) else NULL
+      )
+    })
+    
+    # render footer (visual) for this device (below the info box)
+    output$device_footer_ui <- renderUI({
+      if (!is.null(dl$footer_path) && nzchar(dl$footer_path)) {
+        tagList(tags$hr(), tags$div(class = "app-footer", tags$img(src = dl$footer_path, alt = "Geräte-Fuß")))
+      } else if (!is.null(dl$footer_text) && nzchar(dl$footer_text)) {
+        tagList(tags$hr(), tags$div(class = "app-footer", dl$footer_text))
+      } else NULL
+    })
   }
+  
+  # Save device info (editable by any authenticated user)
+  observeEvent(input$save_device_info, {
+    req(rv$authed, rv$current_device)
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    who <- rv$user %||% "unknown"
+    txt <- input$device_info_text %||% ""
+    # Save footer_text for the device (this is the editable info box)
+    save_device_layout(con, rv$current_device, title = NULL, footer_text = txt, footer_path = NULL, footer_mime = NULL, who = who)
+    # Refresh UI: re-render device info area and footer display
+    dl <- load_device_layout(con, rv$current_device)
+    output$device_info_area <- renderUI({
+      box(
+        width = 12, title = "Geräte-Informationen (editable)", status = "primary", solidHeader = TRUE,
+        if (!is.null(dl$footer_path) && nzchar(dl$footer_path)) {
+          tagList(
+            tags$div("Hinweis: Ein Gerätebild ist hinterlegt und wird unten angezeigt (manuelles Upload in www/uploads/)."),
+            tags$div(tags$img(src = dl$footer_path, style = "max-height:120px;"))
+          )
+        } else NULL,
+        textAreaInput("device_info_text", "Informationen zum Gerät (sichtbar für alle):", value = dl$footer_text %||% "", rows = 4),
+        actionButton("save_device_info", "Speichern", class = "btn btn-primary"),
+        if (!is.null(dl$updated_at)) tags$small(sprintf(" Letzte Änderung: %s von %s", format(as.POSIXct(dl$updated_at, tz = "UTC"), "%Y-%m-%d %H:%M"), dl$updated_by)) else NULL
+      )
+    })
+    output$device_footer_ui <- renderUI({
+      if (!is.null(dl$footer_path) && nzchar(dl$footer_path)) {
+        tagList(tags$hr(), tags$div(class = "app-footer", tags$img(src = dl$footer_path, alt = "Geräte-Fuß")))
+      } else if (!is.null(dl$footer_text) && nzchar(dl$footer_text)) {
+        tagList(tags$hr(), tags$div(class = "app-footer", dl$footer_text))
+      } else NULL
+    })
+    showNotification("Geräteinformationen gespeichert.", type = "message")
+  })
   
   output$device_title <- renderUI({
     req(rv$current_device)
     con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
     lab <- DBI::dbGetQuery(con, "SELECT label FROM devices WHERE device_id = $1", params = list(rv$current_device))$label
     if (length(lab) == 0 || is.na(lab)) lab <- rv$current_device
+    display_title <- if (!is.null(rv$current_device_title) && nzchar(rv$current_device_title)) rv$current_device_title else lab
     tagList(
-      h3(paste("Checkliste ·", lab)),
+      h3(paste("Checkliste ·", display_title)),
       tags$small(sprintf("Angemeldet als %s%s (%s)",
                          rv$user, if (rv$role == "admin") " (Admin)" else "", rv$user_initials))
     )
@@ -837,7 +1201,7 @@ server <- function(input, output, session) {
     req(rv$data, input$section)
     section <- input$section
     header_idx <- which(rv$data$Header == section)
-    next_header_idx <- suppressWarnings(min(which((1:nrow(rv$data)) > max(header_idx) & rv$data$Header != "")))
+    next_header_idx <- suppressWarnings(min(which(seq_len(nrow(rv$data)) > max(header_idx) & rv$data$Header != "")))
     if (is.infinite(next_header_idx)) next_header_idx <- nrow(rv$data) + 1
     insert_idx <- next_header_idx - 1
     
@@ -852,7 +1216,14 @@ server <- function(input, output, session) {
     new_row$Kommentar <- ""
     new_row$Benutzer  <- ""
     
-    rv$data <- rbind(rv$data[1:insert_idx, ], new_row, rv$data[(insert_idx+1):nrow(rv$data), ])
+    # Handle edge cases for rbind
+    if (insert_idx <= 0) {
+      rv$data <- rbind(new_row, rv$data)
+    } else if (insert_idx >= nrow(rv$data)) {
+      rv$data <- rbind(rv$data, new_row)
+    } else {
+      rv$data <- rbind(rv$data[seq_len(insert_idx), ], new_row, rv$data[seq(insert_idx+1, nrow(rv$data)), ])
+    }
     rv$data <- order_cols(rv$data)
     
     output$tableRH <- renderRHandsontable({
@@ -892,7 +1263,6 @@ server <- function(input, output, session) {
         rr <- r
         cid <- paste0("task_done_", rr)
         oid <- paste0("task_opt_", rr)
-        other_id <- paste0("task_other_", rr)
         
         # when checkbox toggled
         observeEvent(input[[cid]], {
@@ -903,93 +1273,38 @@ server <- function(input, output, session) {
           who <- rv$user_initials %||% rv$user
           is_admin <- identical(rv$role, "admin")
           
-          sel <- isolate(input[[oid]] %||% "1")
-          other_txt <- isolate(input[[other_id]] %||% "")
-          
           if (val) {
-            txt <- if (identical(sel, "Andere")) {
-              if (nzchar(other_txt)) other_txt else "Andere"
-            } else sel
-            cell_val <- paste0("\u2713 ", txt, if (nzchar(who)) paste0(" (", who, ")") else "")
-            # Only write if different
-            cur <- ""
-            ss <- rv$table_status
-            if (nrow(ss)) {
-              sel_row <- ss$row_index == rr & ss$day == today
-              if (any(sel_row)) cur <- ss$value_text[which(sel_row)[1]]
-            }
-            if (!identical(cur, cell_val)) upsert_cell(con, rv$current_device, rr, today, cell_val, who)
+            # If checkbox is checked, put checkmark with username and clear dropdown
+            updateSelectInput(session, oid, selected = "")
+            cell_val <- paste0("\u2713 (", who, ")")
+            upsert_cell(con, rv$current_device, rr, today, cell_val, who)
+
           } else {
             # delete only if present
-            cur <- ""
-            ss <- rv$table_status
-            if (nrow(ss)) {
-              sel_row <- ss$row_index == rr & ss$day == today
-              if (any(sel_row)) cur <- ss$value_text[which(sel_row)[1]]
-            }
-            if (nzchar(cur)) delete_cell_if_owner(con, rv$current_device, rr, today, who, is_admin)
+            delete_cell_if_owner(con, rv$current_device, rr, today, who, is_admin)
           }
+          # Simple update without complex reactive dependencies
           rv$table_status <- load_cell_status(con, rv$current_device)
-          output$tableRH <- renderRHandsontable({
-            cells_readonly_for_headers(rv$data, rv$user_initials, rv$table_status, rv$role, rv$invalid_days)
-          })
         }, ignoreInit = TRUE)
         
-        # when select input changed -> if already checked, update the cell (use isolate)
+        # when select input changed -> uncheck checkbox and put abbreviation only
         observeEvent(input[[oid]], {
           req(rv$current_device, rv$data)
-          val_checked <- isTRUE(isolate(input[[cid]]))
-          if (!val_checked) return()
-          con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
-          today <- as.integer(format(Sys.Date(), "%d"))
-          who <- rv$user_initials %||% rv$user
-          sel <- isolate(input[[oid]] %||% "1")
-          other_txt <- isolate(input[[other_id]] %||% "")
+          sel <- input[[oid]]
+          if (is.null(sel) || sel == "") return()  # Ignore empty selection
           
-          txt <- if (identical(sel, "Andere")) {
-            if (nzchar(other_txt)) other_txt else "Andere"
-          } else sel
-          cell_val <- paste0("\u2713 ", txt, if (nzchar(who)) paste0(" (", who, ")") else "")
-          cur <- ""
-          ss <- rv$table_status
-          if (nrow(ss)) {
-            sel_row <- ss$row_index == rr & ss$day == today
-            if (any(sel_row)) cur <- ss$value_text[which(sel_row)[1]]
-          }
-          if (!identical(cur, cell_val)) {
-            upsert_cell(con, rv$current_device, rr, today, cell_val, who)
-            rv$table_status <- load_cell_status(con, rv$current_device)
-            output$tableRH <- renderRHandsontable({
-              cells_readonly_for_headers(rv$data, rv$user_initials, rv$table_status, rv$role, rv$invalid_days)
-            })
-          }
-        }, ignoreInit = TRUE)
-        
-        # when "Andere" text changed -> update only when checked & selected opt == "Andere"
-        observeEvent(input[[other_id]], {
-          req(rv$current_device, rv$data)
-          val_checked <- isTRUE(isolate(input[[cid]]))
-          sel <- isolate(input[[oid]] %||% "1")
-          if (!val_checked || !identical(sel, "Andere")) return()
+          # Uncheck the checkbox when dropdown is selected
+          updateCheckboxInput(session, cid, value = FALSE)
+          
           con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
           today <- as.integer(format(Sys.Date(), "%d"))
           who <- rv$user_initials %||% rv$user
-          other_txt <- isolate(input[[other_id]] %||% "")
-          txt <- if (nzchar(other_txt)) other_txt else "Andere"
-          cell_val <- paste0("\u2713 ", txt, if (nzchar(who)) paste0(" (", who, ")") else "")
-          cur <- ""
-          ss <- rv$table_status
-          if (nrow(ss)) {
-            sel_row <- ss$row_index == rr & ss$day == today
-            if (any(sel_row)) cur <- ss$value_text[which(sel_row)[1]]
-          }
-          if (!identical(cur, cell_val)) {
-            upsert_cell(con, rv$current_device, rr, today, cell_val, who)
-            rv$table_status <- load_cell_status(con, rv$current_device)
-            output$tableRH <- renderRHandsontable({
-              cells_readonly_for_headers(rv$data, rv$user_initials, rv$table_status, rv$role, rv$invalid_days)
-            })
-          }
+          
+          # Extract abbreviation from full text and put only that in the cell
+          abbrev <- sub("^([A-Za-z.øØ]+).*", "\\1", sel)  # Extract the part before the first space/parenthesis
+          upsert_cell(con, rv$current_device, rr, today, abbrev, who)
+          # Simple update without complex reactive dependencies
+          rv$table_status <- load_cell_status(con, rv$current_device)
         }, ignoreInit = TRUE)
         
       })
@@ -1015,7 +1330,7 @@ server <- function(input, output, session) {
     
     # make sure observers exist for data rows (non-header)
     data_rows <- which(rv$data$Header == "")
-    ensure_task_observers(data_rows)
+    
     
     ui_list <- list(div(style = "margin-bottom:8px;", strong(format(Sys.Date(), "%A, %d.%m.%Y"))))
     
@@ -1026,41 +1341,61 @@ server <- function(input, output, session) {
       
       if (is_header_row) {
         # Render header row (group label). Use a stronger visual style.
-        ui_list <- append(ui_list, list(div(style = "padding:6px 0; font-weight:600; background:#f5f5f5; margin-top:6px; padding-left:6px;", hdr)))
+ui_list <- append(ui_list, list(
+  div(
+    style = "padding:6px 0; font-weight:600; background:#FFC000; margin-top:6px; padding-left:6px;",
+    hdr
+  )
+))
       } else {
         # Render a task row (with checkbox/select)
         task_name <- if (nzchar(task_text)) task_text else paste0("Aufgabe ", r)
         done_id <- paste0("task_done_", r)
         opt_id  <- paste0("task_opt_", r)
-        other_id <- paste0("task_other_", r)
         
         existing_val <- existing_for_today[[ as.character(r) ]] %||% ""
-        is_done <- r %in% done_rows
-        selected_opt <- "1"
-        other_txt <- ""
+        is_done <- FALSE
+        selected_opt <- ""
+
+        # parsing existing_val (handle both old and new formats)
         if (nzchar(existing_val)) {
-          v <- existing_val
-          v <- sub("^\\s*\u2713\\s*", "", v)
-          v <- sub("\\s*\\([^)]*\\)\\s*$", "", v)
-          parts <- strsplit(v, " - ", fixed = TRUE)[[1]]
-          if (length(parts) >= 2) {
-            selected_opt <- "Andere"
-            other_txt <- paste(parts[-1], collapse = " - ")
+          v <- trimws(as.character(existing_val))
+          if (startsWith(v, "\u2713")) {  # "\u2713" is the actual ✓ character
+            is_done <- TRUE
+            selected_opt <- ""
+          } else if (v %in% TASK_OPTIONS) {
+            # One of our full task options - show in dropdown
+            is_done <- FALSE
+            selected_opt <- v
+          } else if (v %in% c("WE", "FT", "Ø", "W.e.", "ne", "D", "sB", "sQ")) {
+            # Abbreviation format - map to full format
+            abbrev_map <- c(
+              "WE" = "WE (Wochenende)",
+              "FT" = "FT (Feiertag)", 
+              "Ø" = "Ø (An diesem Tag wurden keine Analysen gestartet)",
+              "W.e." = "W.e. (Wartungspunkt ist in einer größeren Wartung enthalten)",
+              "ne" = "ne (Nicht erforderlich)",
+              "D" = "D (Gerät / Modul defekt)",
+              "sB" = "sB (Siehe Bemerkungen)",
+              "sQ" = "sQ (Siehe Quasi)"
+            )
+            is_done <- FALSE
+            selected_opt <- abbrev_map[v] %||% ""
           } else {
-            token <- trimws(parts[[1]])
-            if (token %in% c("1","2","3","4")) selected_opt <- token else { selected_opt <- "Andere"; other_txt <- token }
+            # Unknown format - default to not done
+            is_done <- FALSE
+            selected_opt <- ""
           }
-          is_done <- TRUE
         }
-        
+
         row_ui <- div(style = "border-bottom:1px solid #eee; padding:8px 0;",
                       fluidRow(
-                        column(7, div(strong(task_name))),
+                        column(5, div(strong(task_name))),
                         column(3, checkboxInput(done_id, label = "Erledigt", value = is_done, width = "100%")),
-                        column(2, selectInput(opt_id, label = NULL, choices = c("1","2","3","4","Andere"), selected = selected_opt, width = "100%"))
-                      ),
-                      conditionalPanel(condition = sprintf("input.%s == 'Andere'", opt_id),
-                                       textInput(other_id, label = "Weitere Angaben", value = other_txt, width = "100%"))
+                        column(4, selectInput(opt_id, label = "Andere Option", 
+                                            choices = c("", TASK_OPTIONS), 
+                                            selected = if(is_done) "" else selected_opt, width = "100%"))
+                      )
         )
         ui_list <- append(ui_list, list(row_ui))
       }
@@ -1068,6 +1403,13 @@ server <- function(input, output, session) {
     
     do.call(tagList, ui_list)
   })
+
+observeEvent(rv$data, {
+  req(rv$data)
+  data_rows <- which(rv$data$Header == "")
+  # ensure_task_observers will create observers for new rows only
+  ensure_task_observers(data_rows)
+}, ignoreNULL = TRUE)
   
   observeEvent(input$mark_today, {
     req(rv$current_device, rv$data)
@@ -1083,6 +1425,11 @@ server <- function(input, output, session) {
       upsert_cell(con, rv$current_device, r, today, paste0("\u2713 ", who), who)
     }
     rv$table_status <- load_cell_status(con, rv$current_device)
+  })
+  
+  # Simple observer to update handsontable when table_status changes (like old code pattern)
+  observe({
+    req(rv$current_device, rv$data, rv$table_status)
     output$tableRH <- renderRHandsontable({
       cells_readonly_for_headers(rv$data, rv$user_initials, rv$table_status, rv$role, rv$invalid_days)
     })
@@ -1103,22 +1450,34 @@ server <- function(input, output, session) {
     filename = function() paste0("Wartungsplan_", Sys.Date(), ".pdf"),
     content = function(file) {
       req(rv$data)
+      
+      # Check if required packages are available
+      required_pkgs <- c("rmarkdown", "knitr", "kableExtra")
+      missing_pkgs <- required_pkgs[!sapply(required_pkgs, requireNamespace, quietly = TRUE)]
+      if (length(missing_pkgs) > 0) {
+        stop("Missing required packages for PDF generation: ", paste(missing_pkgs, collapse = ", "))
+      }
+      
       con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
       pdf_df <- build_overlayed_table(rv$data, load_cell_status(con, rv$current_device))
-      owd <- setwd(tempdir()); on.exit(setwd(owd), add = TRUE)
-      rmd_content <- "
----
+      
+      # Create temporary directory for PDF generation
+      temp_dir <- tempdir()
+      owd <- setwd(temp_dir); on.exit(setwd(owd), add = TRUE)
+      
+      # Simplified R markdown template with better error handling
+      rmd_content <- paste0("---
 title: 'Wartungsplan'
-date: '`r format(Sys.Date(), \"%d.%m.%Y\")`'
+date: '", format(Sys.Date(), "%d.%m.%Y"), "'
 output:
   pdf_document:
-    latex_engine: xelatex
+    latex_engine: pdflatex
     keep_tex: no
     number_sections: false
 header-includes:
   - \\usepackage{longtable}
-  - \\usepackage{pdflscape}
   - \\usepackage{array}
+  - \\usepackage[utf8]{inputenc}
   - \\usepackage[T1]{fontenc}
   - \\usepackage{lmodern}
   - \\setlength{\\tabcolsep}{2pt}
@@ -1130,30 +1489,126 @@ params:
 \\tiny
 
 ```{r, echo=FALSE, results='asis'}
-nr_cols <- ncol(params$table_data)
-align_spec <- paste(rep('c', nr_cols), collapse='')
-knitr::kable(
-  params$table_data,
-  format    = 'latex',
-  booktabs  = FALSE,
-  longtable = TRUE,
-  align     = align_spec,
-  linesep   = '\\\\hline'
-)
-```"
-  temp_rmd <- file.path(tempdir(), "wartungsplan_report.Rmd")
-  writeLines(rmd_content, temp_rmd, useBytes = TRUE)
-  tmp_pdf <- file.path(tempdir(), "wartungsplan_rendered.pdf")
-  rmarkdown::render(
-    temp_rmd,
-    output_format = rmarkdown::pdf_document(latex_engine = "xelatex"),
-    output_file = basename(tmp_pdf),
-    params = list(table_data = pdf_df),
-    envir = new.env(parent = globalenv())
-  )
-  file.copy(tmp_pdf, file, overwrite = TRUE)
+library(knitr)
+library(kableExtra)
+
+# Ensure table_data is available
+if (is.null(params$table_data) || nrow(params$table_data) == 0) {
+  cat('No data available for PDF generation.')
+} else {
+  # Create alignment specification
+  nr_cols <- ncol(params$table_data)
+  align_spec <- paste(rep('c', nr_cols), collapse='')
+  
+  # Generate table
+  kable(params$table_data,
+        format = 'latex',
+        booktabs = FALSE,
+        longtable = TRUE,
+        align = align_spec,
+        escape = FALSE) %>%
+    kable_styling(latex_options = c('repeat_header'))
+}
+```
+")
+      
+      # Write R markdown file
+      temp_rmd <- file.path(temp_dir, "wartungsplan_report.Rmd")
+      writeLines(rmd_content, temp_rmd, useBytes = TRUE)
+      
+      # Generate PDF
+      tmp_pdf <- file.path(temp_dir, "wartungsplan_rendered.pdf")
+      
+      tryCatch({
+        rmarkdown::render(
+          temp_rmd,
+          output_format = rmarkdown::pdf_document(latex_engine = "pdflatex"),
+          output_file = basename(tmp_pdf),
+          params = list(table_data = pdf_df),
+          envir = new.env(parent = globalenv()),
+          quiet = TRUE
+        )
+        
+        # Check if PDF was created successfully
+        if (!file.exists(tmp_pdf)) {
+          stop("PDF generation failed - output file not created")
+        }
+        
+        # Copy to final destination
+        file.copy(tmp_pdf, file, overwrite = TRUE)
+        
+      }, error = function(e) {
+        # Fallback: Try HTML to PDF conversion
+        warning("LaTeX PDF generation failed, trying HTML method: ", e$message)
+        
+        tryCatch({
+          # Create HTML version first
+          html_content <- paste0("
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset='UTF-8'>
+  <title>Wartungsplan</title>
+  <style>
+    body { font-family: Arial, sans-serif; font-size: 8pt; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid black; padding: 2px; text-align: center; }
+    .header-row { background-color: #fff7b2; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>Wartungsplan - ", format(Sys.Date(), "%d.%m.%Y"), "</h1>
+  <table>
+")
+          
+          # Add table headers
+          html_content <- paste0(html_content, "<tr>")
+          for (col_name in names(pdf_df)) {
+            html_content <- paste0(html_content, "<th>", htmltools::htmlEscape(col_name), "</th>")
+          }
+          html_content <- paste0(html_content, "</tr>")
+          
+          # Add table rows
+          for (i in seq_len(nrow(pdf_df))) {
+            row_class <- if (nzchar(pdf_df$Header[i])) " class='header-row'" else ""
+            html_content <- paste0(html_content, "<tr", row_class, ">")
+            for (j in seq_len(ncol(pdf_df))) {
+              cell_value <- htmltools::htmlEscape(as.character(pdf_df[i, j]))
+              html_content <- paste0(html_content, "<td>", cell_value, "</td>")
+            }
+            html_content <- paste0(html_content, "</tr>")
+          }
+          
+          html_content <- paste0(html_content, "
+  </table>
+</body>
+</html>")
+          
+          # Write HTML file
+          html_file <- file.path(temp_dir, "wartungsplan_report.html")
+          writeLines(html_content, html_file, useBytes = TRUE)
+          
+          # Try to render HTML to PDF using rmarkdown
+          rmarkdown::render(
+            html_file,
+            output_format = rmarkdown::html_document(),
+            output_file = basename(sub("\\.html$", ".html", html_file)),
+            quiet = TRUE
+          )
+          
+          # Copy HTML file as final output (user can print to PDF)
+          file.copy(html_file, sub("\\.pdf$", ".html", file), overwrite = TRUE)
+          
+        }, error = function(e2) {
+          # Final fallback to CSV
+          warning("HTML generation also failed, creating CSV instead: ", e2$message)
+          csv_file <- sub("\\.pdf$", ".csv", file)
+          write.csv(pdf_df, csv_file, row.names = FALSE, fileEncoding = "UTF-8")
+          file.copy(csv_file, file, overwrite = TRUE)
+        })
+      })
     },
-  contentType = "application/pdf"
+    contentType = "application/pdf"
   )
 }
 
