@@ -382,34 +382,44 @@ load_device_table <- function(con, device_id) {
   # ensure Task column exists for compatibility
   if (!"Task" %in% names(df)) df$Task <- ""
   
-  # If this is g1 but Task column is empty for all data rows, replace with the custom g1 template
+  # If this is g1, ensure template rows are present (merge/append as needed)
   if (identical(device_id, "g1")) {
+    df_template <- create_initial_table("g1")
+    n_existing <- nrow(df)
+    n_template <- nrow(df_template)
+    
+    # Check if we need to update
+    needs_update <- FALSE
+    
+    # If stored data has fewer rows than template, we need to append
+    if (n_template > n_existing) {
+      needs_update <- TRUE
+      extra <- df_template[(n_existing+1):n_template, , drop = FALSE]
+      # align columns
+      missing_cols <- setdiff(names(df), names(extra))
+      if (length(missing_cols)) for (c in missing_cols) extra[[c]] <- ""
+      extra <- extra[, names(df), drop = FALSE]
+      df <- rbind(df, extra)
+    }
+    
+    # Additionally, if task text is missing for data rows, inject from template
     data_rows <- which(df$Header == "")
     has_task_text <- FALSE
     if (length(data_rows)) {
       has_task_text <- any(nzchar(df$Task[data_rows]))
     }
     if (!has_task_text) {
-      # Merge template into existing table preserving day columns if possible
-      df_template <- create_initial_table("g1")
-      # If existing table has same or more rows we inject Task texts for matching rows,
-      # otherwise append extra template rows.
-      n_existing <- nrow(df)
-      n_template <- nrow(df_template)
       n_min <- min(n_existing, n_template)
       for (i in seq_len(n_min)) {
         if (df$Header[i] == "" && nzchar(df_template$Task[i]) && !nzchar(df$Task[i])) {
           df$Task[i] <- df_template$Task[i]
         }
       }
-      if (n_template > n_existing) {
-        extra <- df_template[(n_existing+1):n_template, , drop = FALSE]
-        # align columns
-        missing_cols <- setdiff(names(df), names(extra))
-        if (length(missing_cols)) for (c in missing_cols) extra[[c]] <- ""
-        extra <- extra[, names(df), drop = FALSE]
-        df <- rbind(df, extra)
-      }
+      needs_update <- TRUE
+    }
+    
+    # Save if we made changes
+    if (needs_update) {
       df <- order_cols(df)
       save_device_table(con, "g1", df, "<system>")
     }
