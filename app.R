@@ -319,6 +319,16 @@ create_initial_table <- function(device_id = NULL) {
     rows <- rbind(rows, mk_row(header = "Montag", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Drogentest-Kontrolle positiv/negativ im Wechsel"))
     
+    # Lower headers with empty task rows so they are visible in the checklist
+    rows <- rbind(rows, mk_row(header = "PFA (SN 00398)", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = ""))
+    
+    rows <- rbind(rows, mk_row(header = "MC1", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = ""))
+    
+    rows <- rbind(rows, mk_row(header = "Multiplate  (SN 310071)", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = ""))
+    
     # Ensure column order: Header, Task, 1..31
     rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
     return(rows)
@@ -377,34 +387,37 @@ load_device_table <- function(con, device_id) {
   # ensure Task column exists for compatibility
   if (!"Task" %in% names(df)) df$Task <- ""
   
-  # If this is g1 but Task column is empty for all data rows, replace with the custom g1 template
+  # Ensure the g1 table is up-to-date with the current template
   if (identical(device_id, "g1")) {
-    data_rows <- which(df$Header == "")
-    has_task_text <- FALSE
-    if (length(data_rows)) {
-      has_task_text <- any(nzchar(df$Task[data_rows]))
-    }
+    df_template <- create_initial_table("g1")
+    n_existing  <- nrow(df)
+    n_template  <- nrow(df_template)
+    needs_save  <- FALSE
+
+    # Only inject task texts when NO data row has any task text yet (first-time migration)
+    data_rows     <- which(df$Header == "")
+    has_task_text <- length(data_rows) > 0 && any(nzchar(df$Task[data_rows]))
     if (!has_task_text) {
-      # Merge template into existing table preserving day columns if possible
-      df_template <- create_initial_table("g1")
-      # If existing table has same or more rows we inject Task texts for matching rows,
-      # otherwise append extra template rows.
-      n_existing <- nrow(df)
-      n_template <- nrow(df_template)
       n_min <- min(n_existing, n_template)
       for (i in seq_len(n_min)) {
         if (df$Header[i] == "" && nzchar(df_template$Task[i]) && !nzchar(df$Task[i])) {
           df$Task[i] <- df_template$Task[i]
+          needs_save <- TRUE
         }
       }
-      if (n_template > n_existing) {
-        extra <- df_template[(n_existing+1):n_template, , drop = FALSE]
-        # align columns
-        missing_cols <- setdiff(names(df), names(extra))
-        if (length(missing_cols)) for (c in missing_cols) extra[[c]] <- ""
-        extra <- extra[, names(df), drop = FALSE]
-        df <- rbind(df, extra)
-      }
+    }
+
+    # Always append rows that exist in the template but are missing from the stored table
+    if (n_template > n_existing) {
+      extra <- df_template[(n_existing + 1):n_template, , drop = FALSE]
+      missing_cols <- setdiff(names(df), names(extra))
+      if (length(missing_cols)) for (col in missing_cols) extra[[col]] <- ""
+      extra <- extra[, names(df), drop = FALSE]
+      df <- rbind(df, extra)
+      needs_save <- TRUE
+    }
+
+    if (needs_save) {
       df <- order_cols(df)
       save_device_table(con, "g1", df, "<system>")
     }
