@@ -159,7 +159,7 @@ apptheme <- create_theme(
 )
 
 # ----------------------------- DB CONFIG  ----------------------------
-get_db_con <- function() {
+pg_con <- function() {
   con <- DBI::dbConnect(
     RPostgres::Postgres(),
     dbname   = Sys.getenv("DB_NAME"),
