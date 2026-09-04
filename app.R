@@ -93,6 +93,7 @@ is_first_workday_of_quarter <- function(d = Sys.Date()) {
 # due date, sliding forward to the next working day if it lands on a weekend.
 MONTHLY_CYCLE_ANCHOR  <- as.Date("2024-01-01")  # Monday – baseline for Monatlich
 TUESDAY_CYCLE_ANCHOR  <- as.Date("2024-01-02")  # Tuesday – baseline for "Am ersten Dienstag im Monat"
+FRIDAY_CYCLE_ANCHOR   <- as.Date("2024-01-05")  # Friday – baseline for "Am ersten Freitag im Monat"
 
 is_due_28day_cycle <- function(d = Sys.Date(), anchor) {
   d <- as.Date(d); anchor <- as.Date(anchor)
@@ -142,6 +143,100 @@ is_biweekly_monday <- function(d = Sys.Date()) {
   (wk %% 2L) == 0L
 }
 
+# Most recent working day (Mon-Fri) strictly before `d`. If today is Monday,
+# returns the previous Friday so the "Vortagsaufgaben" banner skips weekends
+# rather than nagging about Sunday daily tasks that were never expected.
+previous_workday <- function(d = Sys.Date()) {
+  d <- as.Date(d) - 1L
+  # Locale-independent: %u gives 1=Mon..7=Sun.
+  while (as.integer(format(d, "%u")) >= 6L) d <- d - 1L
+  d
+}
+
+# ---- German public holidays (Berlin / federal) ------------------------------
+# Easter Sunday via Gauss/Meeus algorithm; rest derived from it. Covers the
+# fixed dates and the Easter-relative dates that affect lab operations.
+easter_sunday <- function(year) {
+  a <- year %% 19L
+  b <- year %/% 100L
+  c <- year %% 100L
+  d <- b %/% 4L
+  e <- b %% 4L
+  f <- (b + 8L) %/% 25L
+  g <- (b - f + 1L) %/% 3L
+  h <- (19L*a + b - d - g + 15L) %% 30L
+  i <- c %/% 4L
+  k <- c %% 4L
+  l <- (32L + 2L*e + 2L*i - h - k) %% 7L
+  m <- (a + 11L*h + 22L*l) %/% 451L
+  month <- (h + l - 7L*m + 114L) %/% 31L
+  day   <- ((h + l - 7L*m + 114L) %% 31L) + 1L
+  as.Date(sprintf("%04d-%02d-%02d", year, month, day))
+}
+de_holidays_for_year <- function(year) {
+  year <- as.integer(year)
+  es   <- easter_sunday(year)
+  c(
+    as.Date(sprintf("%04d-01-01", year)),  # Neujahr
+    es - 2L,                                # Karfreitag
+    es + 1L,                                # Ostermontag
+    as.Date(sprintf("%04d-05-01", year)),  # Tag der Arbeit
+    es + 39L,                               # Christi Himmelfahrt
+    es + 50L,                               # Pfingstmontag
+    as.Date(sprintf("%04d-10-03", year)),  # Tag der Deutschen Einheit
+    as.Date(sprintf("%04d-10-31", year)),  # Reformationstag (Niedersachsen)
+    as.Date(sprintf("%04d-12-25", year)),  # 1. Weihnachtstag
+    as.Date(sprintf("%04d-12-26", year))   # 2. Weihnachtstag
+  )
+}
+is_de_holiday <- function(d) {
+  d <- as.Date(d)
+  if (length(d) == 0L || any(is.na(d))) return(rep(FALSE, length(d)))
+  yrs <- unique(as.integer(format(d, "%Y")))
+  hols <- do.call(c, lapply(yrs, de_holidays_for_year))
+  d %in% hols
+}
+is_workday <- function(d) {
+  d <- as.Date(d)
+  iso <- as.integer(format(d, "%u"))
+  !is.na(iso) & iso < 6L & !is_de_holiday(d)
+}
+
+# Slide a date forward to the next working day if it falls on a weekend or
+# public holiday. Used so a Wednesday reminder is moved to the next Thursday
+# (or further) when Wednesday is a holiday like 25.12. or 01.05.
+shift_to_next_workday <- function(d) {
+  d <- as.Date(d)
+  while (!is_workday(d)) d <- d + 1L
+  d
+}
+
+# Wednesday on or after `d` (ISO Wednesday = 3). Holiday/weekend handling is
+# applied by the caller via shift_to_next_workday() so the helper itself stays
+# pure.
+next_wednesday <- function(d = Sys.Date()) {
+  d <- as.Date(d)
+  off <- (3L - as.integer(format(d, "%u"))) %% 7L
+  d + off
+}
+
+# Thursday on or after `d` (ISO Thursday = 4).
+next_thursday <- function(d = Sys.Date()) {
+  d <- as.Date(d)
+  off <- (4L - as.integer(format(d, "%u"))) %% 7L
+  d + off
+}
+
+# Wednesday in the calendar month of `d`, shifted to the next workday if it
+# falls on a public holiday. By default we use the FIRST Wednesday of that
+# month, which is the canonical reminder day.
+wednesday_of_month <- function(d, which = 1L) {
+  d  <- as.Date(d)
+  m1 <- as.Date(format(d, "%Y-%m-01"))
+  w  <- next_wednesday(m1) + (as.integer(which) - 1L) * 7L
+  shift_to_next_workday(w)
+}
+
 # ----------------------------- THEME (fresh/AdminLTE) -------------------------
 DARK_BLUE <- "#003B73"
 MID_TEAL  <- "#136377"
@@ -159,17 +254,16 @@ apptheme <- create_theme(
 )
 
 # ----------------------------- DB CONFIG  ----------------------------
-get_db_con <- function() {
+pg_con <- function() {
   con <- DBI::dbConnect(
     RPostgres::Postgres(),
     dbname   = Sys.getenv("DB_NAME"),
     host     = Sys.getenv("DB_HOST"),
-    port     = as.integer(Sys.getenv("PGPORT", "5433")),  
+    port     = as.integer(Sys.getenv("DB_PORT", "5433")),  
     user     = Sys.getenv("DB_USER"),
     password = Sys.getenv("DB_PASSWORD"),
     sslmode  = "disable"
   )
-  
   
   DBI::dbExecute(con, "SET timezone = 'Europe/Berlin'")
   
@@ -182,43 +276,53 @@ has_column <- function(con, table_name, column_name) {
         WHERE table_schema='public' AND table_name=$1 AND column_name=$2"
   nrow(DBI::dbGetQuery(con, q, params = list(table_name, column_name))) > 0
 }
+
 ensure_schema <- function() {
   con <- pg_con()
   on.exit(dbDisconnect(con), add = TRUE)
   
   # Clear old data to force rebuild from template
   try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g1'"), silent = TRUE) #PFA, Cobas 411, Multiplate, MC1  <- g1
-
+  
   try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g2'"), silent = TRUE) #Euroimmun Analyser <- g2
-
+  
   try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g3'"), silent = TRUE) #Cobas 8100 <- g3
-
+  
   try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g4'"), silent = TRUE) #Cobas Pro I <- g4
-
+  
   try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g5'"), silent = TRUE) #Cobas Pro II <- g5
-
-  try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g6'"), silent = TRUE) #CS <- g6
-
+  
+  try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g6'"), silent = TRUE) #CS1 <- g6
+  
   try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g7'"), silent = TRUE) #Hämatologie <- g7
   
   try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g8'"), silent = TRUE)  #Hydrasys <- g8
   
   try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g9'"), silent = TRUE) #Optilite <- g9
-
-try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g10'"), silent = TRUE) #Phadia 250 <- g10
-
-try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g11'"), silent = TRUE) #ROTEM Sigma, Übersichtstabelle Kontrollen <- g11
-
-  try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g12'"), silent = TRUE) #Sysmex XP300 MVZ Onko Ambulanz <- g12
   
-  try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g13'"), silent = TRUE) #Sysmex XP300 MVZ-DEL <- g13
+  try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g10'"), silent = TRUE) #Phadia 250 <- g10
   
-  try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g14'"), silent = TRUE) #Sysmex XQ-320 Onko-Ambulanz, Kinderambulanz <- g14
+  try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g11'"), silent = TRUE) #ROTEM Sigma, Übersichtstabelle Kontrollen <- g11
+  
+  #try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g12'"), silent = TRUE) #Sysmex XP300 MVZ Onko Ambulanz <- g12
+  
+  #try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g13'"), silent = TRUE) #Sysmex XP300 MVZ-DEL <- g13
+  
+  #try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g14'"), silent = TRUE) #Sysmex XQ-320 Onko-Ambulanz, Kinderambulanz <- g14
   
   try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g15'"), silent = TRUE) #Sysmex XQ-320 ZL <- g15
   
+  try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g16'"), silent = TRUE) #CS2 <- g16
   
-
+  # Note: this DELETE forces g17's task list to rebuild from the template
+  # below on every server restart -- convenient while the Probenannahmeplatz
+  # task list is still being finalized, but it also means any structural
+  # edits an admin makes (task text, schedule assignment) via the app will be
+  # lost on the next restart. Remove this line once the template is final.
+  try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g17'"), silent = TRUE) # Probenannahmeplatz <- g17
+  
+  
+  
   # Users
   dbExecute(con, "
     CREATE TABLE IF NOT EXISTS app_users (
@@ -286,7 +390,7 @@ try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g11'"), silent 
     );
   ")
   dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cell_status_device ON device_cell_status(device_id);")
-
+  
   # ---- Migration: add month/year columns so historical months are preserved ----
   tryCatch({
     dbExecute(con, "ALTER TABLE device_cell_status ADD COLUMN IF NOT EXISTS month INT;")
@@ -319,7 +423,7 @@ try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g11'"), silent 
     dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_cell_status_dev_my
                        ON device_cell_status(device_id, year, month);")
   }, error = function(e) message("device_cell_status migration: ", conditionMessage(e)))
-
+  
   # Per-task / per-day remarks (Bemerkungen). Keyed by full date so previous
   # days' remarks can be surfaced when a user opens today's tasks.
   dbExecute(con, "
@@ -335,6 +439,20 @@ try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g11'"), silent 
     );
   ")
   dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_task_remark_device_date ON device_task_remark(device_id, remark_date);")
+  
+  # Per-task row-level metadata. Currently stores the "zuletzt getauscht am"
+  # date for tasks that ask the user to record when a part was last replaced.
+  dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS device_task_meta (
+      device_id          TEXT NOT NULL REFERENCES devices(device_id) ON DELETE CASCADE,
+      row_index          INT  NOT NULL,
+      last_replaced_date DATE,
+      updated_by         TEXT,
+      updated_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      PRIMARY KEY (device_id, row_index)
+    );
+  ")
+  dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_task_meta_device ON device_task_meta(device_id);")
   
   # Per-device layout table
   dbExecute(con, "
@@ -371,6 +489,17 @@ try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g11'"), silent 
     ON CONFLICT (id) DO NOTHING;
   ")
   
+  # If no header logo has been set yet, default to hub-header.png (placed
+  # directly in www/) so the Klinikum logo shows up without needing a
+  # manual DB edit. Only fills in when empty -- never overwrites a path an
+  # admin already set via the Layout tab.
+  dbExecute(con, "
+    UPDATE app_images
+       SET img_path = 'hub-header.png'
+     WHERE id = 'hub_header'
+       AND (img_path IS NULL OR img_path = '');
+  ")
+  
   # Serial number history table
   dbExecute(con, "
     CREATE TABLE IF NOT EXISTS serial_number_history (
@@ -386,7 +515,26 @@ try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g11'"), silent 
   dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_serial_history_device ON serial_number_history(device_id);")
   dbExecute(con, "CREATE INDEX IF NOT EXISTS idx_serial_history_date ON serial_number_history(changed_at DESC);")
   
+  # "Als gelesen markieren" for the open-tasks login popup: one row per day,
+  # storing a fingerprint of which devices/counts were shown. As long as the
+  # fingerprint doesn't change, the popup stays suppressed for the rest of
+  # that day (across logins/users); a genuinely new/changed open task
+  # produces a different fingerprint, so the popup reappears for that.
+  dbExecute(con, "
+    CREATE TABLE IF NOT EXISTS due_dialog_ack (
+      ack_date    DATE PRIMARY KEY,
+      fingerprint TEXT NOT NULL,
+      acked_by    TEXT,
+      acked_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+  ")
+  
   # Seed devices
+  # Note: g12, g13, g14 (old Sysmex XP300/XQ-320 units) were decommissioned
+  # -- their auto-rebuild lines above are already commented out and they're
+  # not part of any Arbeitsplatz -- but they were never removed from this
+  # seed list, so they kept being (re)created and inflating "Geräte gesamt".
+  # Removed from the seed here, and actively cleaned up below.
   dbExecute(con, "
   INSERT INTO devices (device_id, label) VALUES
     ('g1',  'PFA, Cobas 411, Multiplate, MC1'),
@@ -394,20 +542,30 @@ try(dbExecute(con, "DELETE FROM device_tables WHERE device_id = 'g11'"), silent 
     ('g3',  'Cobas 8100'),
     ('g4',  'COBAS Pro I'),
     ('g5',  'COBAS Pro II'),
-    ('g6',  'CS'),
+    ('g6',  'CS1'),
     ('g7',  'Hämatologie'),
     ('g8',  'Hydrasys'),                                         
     ('g9',  'Optilite'),
     ('g10', 'Phadia 250'),
     ('g11', 'ROTEM Sigma, Übersichtstabelle Kontrollen'),         
-    ('g12', 'Sysmex XP300 MVZ Onko Ambulanz'),                  
-    ('g13', 'Sysmex XP300 MVZ-DEL'),                             
-    ('g14', 'Sysmex XQ-320 Onko-Ambulanz, Kinderambulanz'),      
-    ('g15', 'Sysmex XQ-320 ZL')                                     
+    ('g15', 'Sysmex XQ-320 ZL + Onko-Ambulanz, Kinderambulanz, DEL'),
+    ('g16', 'CS2'),
+    ('g17', 'Probenannahmeplatz')
   ON CONFLICT (device_id) DO UPDATE
     SET label = EXCLUDED.label;
 ")
-
+  
+  # Best-effort removal of the decommissioned g12/g13/g14 device rows. This
+  # is wrapped in try(silent=TRUE) per device because a foreign key
+  # violation (if any historical task/cell/remark data still references
+  # them) would otherwise abort -- in that case the row is simply left in
+  # place rather than losing that history, and "Geräte gesamt" will need a
+  # manual look to fully resolve for that one device.
+  for (.old_did in c("g12", "g13", "g14")) {
+    try(dbExecute(con, "DELETE FROM devices WHERE device_id = $1", params = list(.old_did)),
+        silent = TRUE)
+  }
+  
   # Seed default admin users (frwi, yaka, mabr). They keep their password if
   # it is already set; only the role is enforced to 'admin'. New seeded users
   # have must_reset = TRUE so they set their own password on first login.
@@ -517,7 +675,7 @@ load_device_serials <- function(con, device_id) {
         "COBAS Pro II" = list(label = "COBAS Pro II", sn = "", pattern = "^[0-9]{4,10}$")
       ),
       "g6" = list(
-        "CS" = list(label = "CS", sn = "", pattern = "^[0-9A-Z]{0,15}$")
+        "CS 1" = list(label = "CS 1", sn = "", pattern = "^[0-9A-Z]{0,15}$")
       ),
       "g7" = list(
         "Hämatologie" = list(label = "Hämatologie", sn = "", pattern = "^[0-9A-Z]{0,15}$")
@@ -534,17 +692,23 @@ load_device_serials <- function(con, device_id) {
       "g11" = list(
         "ROTEM Sigma" = list(label = "ROTEM Sigma, Übersichtstabelle Kontrollen", sn = "", pattern = "^[0-9A-Z]{0,15}$")
       ),
-      "g12" = list(
-        "Sysmex XP300 MVZ Onko Ambulanz" = list(label = "Sysmex XP300 MVZ Onko Ambulanz", sn = "", pattern = "^[0-9A-Z]{0,15}$")
-      ),
-      "g13" = list(
-        "Sysmex XP300 MVZ-DEL" = list(label = "Sysmex XP300 MVZ-DEL", sn = "", pattern = "^[0-9A-Z]{0,15}$")
-      ),
-      "g14" = list(
-        "Sysmex XQ-320 Onko-Ambulanz, Kinderambulanz" = list(label = "Sysmex XQ-320 Onko-Ambulanz, Kinderambulanz", sn = "", pattern = "^[0-9A-Z]{0,15}$")
-      ),
+      #"g12" = list(
+      #  "Sysmex XP300 MVZ Onko Ambulanz" = list(label = "Sysmex XP300 MVZ Onko Ambulanz", sn = "", pattern = "^[0-9A-Z]{0,15}$")
+      #),
+      #"g13" = list(
+      #  "Sysmex XP300 MVZ-DEL" = list(label = "Sysmex XP300 MVZ-DEL", sn = "", pattern = "^[0-9A-Z]{0,15}$")
+      #),
+      #"g14" = list(
+      #  "Sysmex XQ-320 Onko-Ambulanz, Kinderambulanz" = list(label = "Sysmex XQ-320 Onko-Ambulanz, Kinderambulanz", sn = "", pattern = "^[0-9A-Z]{0,15}$")
+      #),
       "g15" = list(
         "Sysmex XQ-320 ZL" = list(label = "Sysmex XQ-320 ZL", sn = "", pattern = "^[0-9A-Z]{0,15}$")
+      ),
+      "g16" = list(
+        "CS 2" = list(label = "CS 2", sn = "", pattern = "^[0-9A-Z]{0,15}$")
+      ),
+      "g17" = list(
+        "Probenannahmeplatz" = list(label = "Probenannahmeplatz", sn = "", pattern = "^[0-9A-Z]{0,15}$")
       )
     )
     
@@ -734,60 +898,26 @@ create_initial_table <- function(device_id = NULL) {
     # Multiplate section
     rows <- rbind(rows, mk_row(header = "Multiplate  (SN 310071)", task = ""))
     rows <- rbind(rows, mk_row(header = "Am ersten Dienstag im Monat", task = ""))
-    rows <- rbind(rows, mk_row(header = "", task = "Liquid COntrol Set Level 1 und 2 laufen lassen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Liquid Control Set Level 1 und 2 laufen lassen"))
     rows <- rbind(rows, mk_row(header = "", task = "Durchführung siehe Anleitung Multiplate"))
+    
+    # Kryoglobuline section
+    rows <- rbind(rows, mk_row(header = "Täglich (Ablesen zwischen 12:00 und 14:00 Uhr)", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Kryoglobuline ablesen und dokumentieren"))
     
     # Ensure column order: Header, Task, 1..31
     rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
     return(rows)
   }
   
-  
-  
-#---------------Hämatologie (g7)───────────────────────────────────────────────────
+  #---------------Hämatologie (g7)───────────────────────────────────────────────────
   
   if (identical(device_id, "g7")) {
     rows <- NULL
     
     # ── Täglich ──────────────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Täglich", task = ""))
-    rows <- rbind(rows, mk_row(header = "", task = "Farblösungen und Reagenzien überprüfen"))
-    
-    rows <- rbind(rows, mk_row(header = "Nach jeder Migration:", task = ""))
-    rows <- rbind(rows, mk_row(header = "", 
-    task = "Reinigung der Migrationsfläche
-            Reinigung des Elektrodenrahmens
-            Reinigung der Antiserenmaske unter fließendem Wasser, anschließendes Spülen mit A.dest."))
-    
-    # ── Wöchentlich ───────────────────────────────────────────────────────────
-    rows <- rbind(rows, mk_row(header = "Wöchentlich", task = ""))
-    rows <- rbind(rows, mk_row(header = "", task = "Programm TANKREINIGUNG für den Färbetank starten"))
-    rows <- rbind(rows, mk_row(header = "", task = "Schlauchsystem überprüfen"))
-    rows <- rbind(rows, mk_row(header = "", task = "Gerät äußerlich reinigen"))
-
-    # ── Monatlich ───────────────────────────────────────────────────────────
-    rows <- rbind(rows, mk_row(header = "Wöchentlich", task = ""))
-    rows <- rbind(rows, mk_row(header = "", task = "Einlesen des Scan Control Film
-                                                    (Überprüfung der densitometrischen  Auswertung) "))
-    rows <- rbind(rows, mk_row(header = "", task = "Auswahl Programm→ Test Pattern→
-                                                    Scann-Icon "))
-    rows <- rbind(rows, mk_row(header = "", task = "Technikereinsatz/ Wartung"))
-    
-
-    
-    rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
-    return(rows)
-  }
-  
-  
-  #-----------------------Hydrasys (g8)──────────────────────────────────────────────
-  
-  if (identical(device_id, "g8")) {
-    rows <- NULL
-    
-    # ── Täglich ──────────────────────────────────────────────────────────────
-    rows <- rbind(rows, mk_row(header = "Täglich", task = ""))
-    rows <- rbind(rows, mk_row(header = "", task = "XN1 / XN2   Shutdown + Neustart (6:00)"))
+    rows <- rbind(rows, mk_row(header = "", task = "XN1 / XN2 Shutdown + Neustart (6:00)"))
     rows <- rbind(rows, mk_row(header = "", task = "SP50 Herunterfahren 1 + Neustart (6:00)"))
     rows <- rbind(rows, mk_row(header = "", task = "Tosoh Herunterfahren + Neustart (6:00)"))
     rows <- rbind(rows, mk_row(header = "", task = "DI-60 Neustart + Objektive putzen (6:30)"))
@@ -806,6 +936,77 @@ create_initial_table <- function(device_id = NULL) {
     rows <- rbind(rows, mk_row(header = "", task = "Bestellung Diff-Platz (Montags)"))
     rows <- rbind(rows, mk_row(header = "", task = "Wöchentliche Wartung SP-50 + Straße Neustart (Mittwoch ab 6:00)"))
     rows <- rbind(rows, mk_row(header = "", task = "Kontrollmaterial erneuern XN+XQ alle Level (Donnerstags)"))
+    
+    rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
+    return(rows)
+  }
+  
+  
+  #-----------------------Hydrasys (g8)──────────────────────────────────────────────
+  
+  if (identical(device_id, "g8")) {
+    rows <- NULL
+    
+    # ── Arbeitstäglich ───────────────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Arbeitstäglich", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Farblösungen und Reagenzien überprüfen"))
+    rows <- rbind(rows, mk_row(header = "Nach jeder Migration", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Reinigung der Migrationsfläche"))
+    rows <- rbind(rows, mk_row(header = "", task = "Reinigung des Elektrodenrahmens"))
+    rows <- rbind(rows, mk_row(header = "", task = "Reinigung der Antiserenmaske unter fließendem Wasser, anschließendes Spülen mit A.dest."))
+    
+    # ── Wöchentlich ───────────────────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Wöchentlich", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Programm TANKREINIGUNG für den Färbetank starten"))
+    rows <- rbind(rows, mk_row(header = "", task = "Schlauchsystem überprüfen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Gerät äußerlich reinigen"))
+    
+    # ── Monatlich ─────────────────────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Monatlich", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Einlesen des Scan Control Film (Überprüfung der densitometrischen Auswertung)"))
+    rows <- rbind(rows, mk_row(header = "", task = "Auswahl Programm → Test Pattern → Scann-Icon"))
+    rows <- rbind(rows, mk_row(header = "", task = "Technikereinsatz / Wartung"))
+    
+    rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
+    return(rows)
+  }
+  
+  
+  #-----------------------Optilite (g9)──────────────────────────────────────────
+  
+  if (identical(device_id, "g9")) {
+    rows <- NULL
+    
+    # ── Arbeitstäglich ───────────────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Arbeitstäglich", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Morgens: Küvettenabfall, Flüssigabfall leeren"))
+    rows <- rbind(rows, mk_row(header = "", task = "Füllstand der Reagenzien prüfen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Systemvorbereitung"))
+    rows <- rbind(rows, mk_row(header = "", task = "Abends: Tagesdaten löschen"))
+    rows <- rbind(rows, mk_row(header = "", task = "\u201eWaschen vor Beenden\u201c durchführen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Bildschirm ausschalten (Schalter a. Rückseite)"))
+    
+    # ── Wöchentlich (Freitags) ──────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Wöchentlich (Freitag)", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Sichern der Datenbank auf USB-Stick"))
+    rows <- rbind(rows, mk_row(header = "", task = "Küvettenabfallbehälter auswaschen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Reagenzteller entnehmen, Kondenswasser aufwischen; Reagenzien in die Kühlzelle"))
+    rows <- rbind(rows, mk_row(header = "", task = "Reinigen der Nadeln und des Mischers"))
+    rows <- rbind(rows, mk_row(header = "", task = "Reinigen der Waschstationen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Reinigung der Luftfilter, linke und rechte Seite"))
+    rows <- rbind(rows, mk_row(header = "", task = "Erst Software, dann Optilite ausschalten"))
+    
+    # ── Monatlich ────────────────────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Monatlich", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Reinigen des Inkubators"))
+    rows <- rbind(rows, mk_row(header = "", task = "Behälter für Flüssigabfall ausspülen (s. Kurzanleitung)"))
+    rows <- rbind(rows, mk_row(header = "", task = "Wasserbehälter reinigen (s. Kurzanleitung)"))
+    
+    # ── Gelegentlich (bei Bedarf) ────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Bei Bedarf", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Touchscreen reinigen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Segmente reinigen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Oberfläche abwischen"))
     
     rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
     return(rows)
@@ -843,7 +1044,7 @@ create_initial_table <- function(device_id = NULL) {
   }
   
   
-
+  
   #-------Sysmex XP300 MVZ Onko Ambulanz (g12) ───────────────────────────────────────
   
   if (identical(device_id, "g12")) {
@@ -856,18 +1057,18 @@ create_initial_table <- function(device_id = NULL) {
     rows <- rbind(rows, mk_row(header = "", task = "morgens Kontrollmessung Level low"))
     rows <- rbind(rows, mk_row(header = "", task = "mittags Kontrollmessung Level normal oder high"))
     rows <- rbind(rows, mk_row(header = "", task = "(wöchentlicher Wechsel)"))
-
+    
     
     # ── Wöchentlich ───────────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Wöchentlich (Freitag)", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Auffangschale reinigen"))
     rows <- rbind(rows, mk_row(header = "", task = "Meßwandlerkammer reinigen"))
-
+    
     
     # ── Wöchentlich ───────────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Monatlich oder alle 2500 Proben", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Abfallkammer reinigen"))
-
+    
     
     # ── Alle 3 Monaten ────────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Alle 3 Monate oder alle 7500 Proben", task = ""))
@@ -941,7 +1142,7 @@ und zusätzlich NORMAL/HIGH im wöchentlichen Wechsel"))
     rows <- rbind(rows, mk_row(header = "", task = "12:00 – 13:00 Uhr Kontrolle LOW"))
     rows <- rbind(rows, mk_row(header = "", task = "Nach der Routine: Shutdown (ohne CellClean)"))
     rows <- rbind(rows, mk_row(header = "", task = "Abfallkanister leeren"))
-
+    
     
     # ── Wöchentlich ───────────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Wöchentlich (Montag)", task = ""))
@@ -974,7 +1175,7 @@ und zusätzlich NORMAL/HIGH im wöchentlichen Wechsel"))
   
   #----------Sysmex XQ-320 (g15)────────────────────────────────────────────────
   
-
+  
   if (identical(device_id, "g15")) {
     rows <- NULL
     
@@ -1017,27 +1218,27 @@ und zusätzlich NORMAL/HIGH im wöchentlichen Wechsel"))
     rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
     return(rows)
   }
-
-
+  
+  
   #----------ROTEM Sigma (g11) ─────────────────────────────────────────────────
-
+  
   if (identical(device_id, "g11")) {
     rows <- NULL
-
+    
     # ── Wöchentliche Kontrollzyklen (Mo / Di / Do / Sa) ───────────────────────
     rows <- rbind(rows, mk_row(header = "Montag", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Start > System > QC (mechanische Kontrolle)"))
     rows <- rbind(rows, mk_row(header = "", task = "Rotrol N Sigma / HEPTEM"))
-
+    
     rows <- rbind(rows, mk_row(header = "Dienstag", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Rotrol N Sigma / APTEM"))
-
+    
     rows <- rbind(rows, mk_row(header = "Donnerstag", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Rotrol P Sigma / HEPTEM"))
-
+    
     rows <- rbind(rows, mk_row(header = "Samstag", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Rotrol P Sigma / APTEM"))
-
+    
     # ── Monatlich ─────────────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Monatlich", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = paste(
@@ -1046,14 +1247,14 @@ und zusätzlich NORMAL/HIGH im wöchentlichen Wechsel"))
       "USB Backup starten \u2192 ok \u2192 warten bis es fertig ist \u2192",
       "beenden \u2192 USB Stick entfernen"
     )))
-
+    
     rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
     return(rows)
   }
-
-
-  #----------CS (g6)────────────────────────────────────────────────
-
+  
+  
+  #----------CS1 (g6)────────────────────────────────────────────────
+  
   if (identical(device_id, "g6")) {
     rows <- NULL
     
@@ -1066,41 +1267,87 @@ und zusätzlich NORMAL/HIGH im wöchentlichen Wechsel"))
     rows <- rbind(rows, mk_row(header = "", task = "OVB erneuern"))
     rows <- rbind(rows, mk_row(header = "", task = "Kontrollen 08:00 Uhr"))
     rows <- rbind(rows, mk_row(header = "", task = "Kontrollen 18:00 Uhr"))
-
-
-    # ── Wöchentlich ─────────────────────────────────────────────────────────
-    rows <- rbind(rows, mk_row(header = "", task = "Mittwochs Abfallbeutel erneuern"))
-    rows <- rbind(rows, mk_row(header = "", task = "Mittwochs Analysator reinigen"))
-    rows <- rbind(rows, mk_row(header = "", task = "Mittwochs Filter reinigen"))
-    rows <- rbind(rows, mk_row(header = "", task = "Montags Bestellung Verbrauchsmaterial"))
-
+    
+    
+    # ── Wöchentlich (Montag) ─────────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Wöchentlich (Montag)", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Bestellung Verbrauchsmaterial"))
+    
+    # ── Wöchentlich (Mittwoch) ───────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Wöchentlich (Mittwoch)", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Abfallbeutel erneuern"))
+    rows <- rbind(rows, mk_row(header = "", task = "Analysator reinigen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Filter reinigen"))
+    
     # ── Monatlich ─────────────────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Monatlich", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "PC herunterfahren und Gerät ausschalten"))
     rows <- rbind(rows, mk_row(header = "", task = "Daten-Back-Up erstellen"))
     rows <- rbind(rows, mk_row(header = "", task = "Spülkanister spülen"))
-    rows <- rbind(rows, mk_row(header = "", task = "Fotometerlampe kalibrieren/wechseln"))
-    rows <- rbind(rows, mk_row(header = "", task = "Alle 1000 Std. (ca. 5 Wochen)	"))
     
-    # ── Wartung bei Bedarf──────────────────────────────────────────────
-    rows <- rbind(rows, mk_row(header = "Bei Bedarf", task = "Technikereinsatz/ Wartung, aktuelle Chargendaten laden"))
+    # ── Bei Bedarf ───────────────────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Bei Bedarf", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Fotometerlampe kalibrieren/wechseln & Alle 1000 Std. (ca. 5 Wochen)"))
     
     
     rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
     return(rows)
   }
-
-
+  
+  
+  #----------CS2 (g16)────────────────────────────────────────────────
+  
+  if (identical(device_id, "g16")) {
+    rows <- NULL
+    
+    # ── Täglich ─────────────────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Täglich", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Herunterfahren der IPU inklusive Pipettor spülen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Verbrauchte Küvetten entsorgen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Flüssigkeitsfalle überprüfen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Küvetten auffüllen"))
+    rows <- rbind(rows, mk_row(header = "", task = "OVB erneuern"))
+    rows <- rbind(rows, mk_row(header = "", task = "Kontrollen 08:00 Uhr"))
+    rows <- rbind(rows, mk_row(header = "", task = "Kontrollen 18:00 Uhr"))
+    
+    
+    # ── Wöchentlich (Montag) ─────────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Wöchentlich (Montag)", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Bestellung Verbrauchsmaterial"))
+    
+    # ── Wöchentlich (Donnerstag) ─────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Wöchentlich (Donnerstag)", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Abfallbeutel erneuern"))
+    rows <- rbind(rows, mk_row(header = "", task = "Analysator reinigen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Filter reinigen"))
+    
+    # ── Monatlich ─────────────────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Monatlich", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "PC herunterfahren und Gerät ausschalten"))
+    rows <- rbind(rows, mk_row(header = "", task = "Daten-Back-Up erstellen"))
+    rows <- rbind(rows, mk_row(header = "", task = "Spülkanister spülen"))
+    
+    # ── Bei Bedarf ───────────────────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Bei Bedarf", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Fotometerlampe kalibrieren/wechseln & Alle 1000 Std. (ca. 5 Wochen)"))
+    
+    
+    rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
+    return(rows)
+  }
+  
+  
   #----------Cobas 8100 (g3) ──────────────────────────────────────────────
-
+  
   if (identical(device_id, "g3")) {
     rows <- NULL
-
+    
     # ── Täglich ──────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Täglich", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "BCL: Kontrolle u. ggf. Auffüllen des Behälters für Aliquotröhrchen"))
     rows <- rbind(rows, mk_row(header = "", task = "AQM: Überprüfen auf Undichtigkeiten („Leak-Check“)"))
     rows <- rbind(rows, mk_row(header = "", task = "RSS: Überprüfen der Verschlussanzahl u. ggf. Auffüllen des Behälters für Verschlüsse"))
-
+    
     # ── Wöchentlich ─────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Wöchentlich", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Cobas 8100: Herunterfahren / Daten löschen, montags (in der Nacht auf Dienstag)"))
@@ -1126,7 +1373,7 @@ und zusätzlich NORMAL/HIGH im wöchentlichen Wechsel"))
     )))
     rows <- rbind(rows, mk_row(header = "", task = "OBS: Kontrolle und Reinigung des Röhrchen-Greifarms"))
     rows <- rbind(rows, mk_row(header = "", task = "P501: Abfallschacht reinigen"))
-
+    
     # ── Monatlich ────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Monatlich", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "ACU1: Kontrolle und Reinigung der Zentrifugenbecher"))
@@ -1142,16 +1389,16 @@ und zusätzlich NORMAL/HIGH im wöchentlichen Wechsel"))
       "Reinigen von Probentrays /",
       "Reinigen der Außenfläche des Gerätes und der Verbindungskomponenten"
     )))
-
+    
     # ── Bei Bedarf ───────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Bei Bedarf", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "P501: Stopfenabfall austauschen / Oberflächen reinigen"))
-
+    
     rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
     return(rows)
   }
-
-
+  
+  
   #----------COBAS Pro I (g4) und COBAS Pro II (g5) ────────────────────────────
   # Beide Geräte teilen sich denselben Wartungsplan, Unterschiede:
   #   Pro I  : grosses Waschrack + Herunterfahren = Mittwoch frueh
@@ -1160,15 +1407,15 @@ und zusätzlich NORMAL/HIGH im wöchentlichen Wechsel"))
   #   Pro II : grosses Waschrack + Herunterfahren = Montag frueh
   #            kleines Waschrack entfaellt montags
   #            BRF-Modul 2
-
+  
   if (identical(device_id, "g4") || identical(device_id, "g5")) {
     is_pro1   <- identical(device_id, "g4")
     big_day   <- if (is_pro1) "Mittwoch" else "Montag"
     skip_day  <- if (is_pro1) "mittwochs" else "montags"
     brf_no    <- if (is_pro1) "1" else "2"
-
+    
     rows <- NULL
-
+    
     # ── Täglich ──────────────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Täglich", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Datenarchiv, Routineabschluss vom Vortag (ND, Wartungspunkt 31)"))
@@ -1176,13 +1423,13 @@ und zusätzlich NORMAL/HIGH im wöchentlichen Wechsel"))
       "c503 kleines grünes Waschrack starten. Entfällt %s, da grosses Waschrack läuft. (ND)",
       skip_day)))
     rows <- rbind(rows, mk_row(header = "", task = "ISE + c503 Probennadel waschen (Wartungspunkt 18, ND)"))
-
+    
     # ── Wöchentlich ──────────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Wöchentlich", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = sprintf("Herunterfahren (%s früh, ND)", big_day)))
     rows <- rbind(rows, mk_row(header = "", task = sprintf(
       "c503 grosses grünes Waschrack starten (%s früh, ND)", big_day)))
-
+    
     # ── Wöchentlich, mittwochs (TD) ──────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Wöchentlich (Mittwoch, TD)", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "ISE + c503 + e801 Spülstationen reinigen"))
@@ -1200,12 +1447,12 @@ und zusätzlich NORMAL/HIGH im wöchentlichen Wechsel"))
     rows <- rbind(rows, mk_row(header = "", task = "Neue Chargen von Ko/Kal installieren + alte löschen"))
     rows <- rbind(rows, mk_row(header = "", task = sprintf(
       "BRF-Modul %s: Reinigung des Röhrchen-Greiferarms", brf_no)))
-
+    
     # ── 14-tägig ─────────────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "14-tägig", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "e801 Messzellreinigung (Dauer ca. 25 Min.)"))
     rows <- rbind(rows, mk_row(header = "", task = "Verfallsdaten von Ko/Kal/Reagenzien in der Kühlzelle überprüfen"))
-
+    
     # ── Monatlich ────────────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Monatlich", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "ISE Mischkammer nur optisch prüfen"))
@@ -1213,30 +1460,30 @@ und zusätzlich NORMAL/HIGH im wöchentlichen Wechsel"))
     rows <- rbind(rows, mk_row(header = "", task = "c503 Reinigen der Luftfilter (Vordertüren + Rackbereich)"))
     rows <- rbind(rows, mk_row(header = "", task = "ISE Schlauchsystem waschen"))
     rows <- rbind(rows, mk_row(header = "", task = "NaCl-Kartusche tauschen (letzte Woche des Monats)"))
-
+    
     # ── Elektrodenaustausch (Wartungspunkt 39) ───────────────────────────────
     rows <- rbind(rows, mk_row(header = "Elektrodenaustausch (Wartungspunkt 39)", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "c503 Austausch ISE-Na+, K+, Cl- Elektrode (ca. alle 2 Monate) – zuletzt getauscht am:"))
     rows <- rbind(rows, mk_row(header = "", task = "c503 Austausch ISE-Sipper- + Quetschschlauch (alle 3 Monate) – zuletzt getauscht am:"))
     rows <- rbind(rows, mk_row(header = "", task = "c503 Austausch ISE-Referenzelektrode (alle 6 Monate) – zuletzt getauscht am:"))
-
+    
     rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
     return(rows)
   }
-
-
- #-----------------------Euroimmun Analyzer I (g2)─────────────────────────────
-
+  
+  
+  #-----------------------Euroimmun Analyzer I (g2)─────────────────────────────
+  
   if (identical(device_id, "g2")) {
     rows <- NULL
-
+    
     # ── Arbeitstäglich ───────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Arbeitstäglich", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Füllstand der Systemflüssigkeit (Kanister unter dem Tisch) prüfen, ggf. mit A.dest auffüllen"))
     rows <- rbind(rows, mk_row(header = "", task = "Vor Analyse: Washer Check starten"))
     rows <- rbind(rows, mk_row(header = "", task = "Nach Analyse: Behälter mit Puffer durch Ersatzgefäße mit A.dest ersetzen und Rinse daily starten"))
     rows <- rbind(rows, mk_row(header = "", task = "Flüssig-Abfallkanister kontrollieren/entleeren"))
-
+    
     # ── Wöchentlich ──────────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Wöchentlich", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Dekontaminieren der Waschstation + Selbsttes"))
@@ -1244,18 +1491,53 @@ und zusätzlich NORMAL/HIGH im wöchentlichen Wechsel"))
     rows <- rbind(rows, mk_row(header = "", task = "Spitzenabwurframpe desinfizieren"))
     rows <- rbind(rows, mk_row(header = "", task = "Abfallkanister entleeren, desinfizieren und spülen"))
     rows <- rbind(rows, mk_row(header = "", task = "Reinigen und desinfizieren der Geräteoberflächen"))
-
+    
     # ── Monatlich ────────────────────────────────────────────────────────────
     rows <- rbind(rows, mk_row(header = "Monatlich, zusätzlich zur täglichen u. wöchentlichen", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Vorratsbehälter m. Reinigungslösung füllen + Maintenance monthly ausführen"))
     rows <- rbind(rows, mk_row(header = "", task = "Vorratsbehälter mit A.dest ausspülen und befüllen Rinse monthly"))
     rows <- rbind(rows, mk_row(header = "", task = "Systemflüssigkeitsbehälter desinfizieren, anschließend gründlich mit A.dest spülen + mit A.dest neu befüllen"))
     rows <- rbind(rows, mk_row(header = "", task = "Pipettorspitze m. fusselfreien Tuch und Ethanol reinigen"))
-
+    
     rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
     return(rows)
   }
-
+  
+  #---------------------Probenannahmeplatz (g17)---------------------------------------
+  
+  if (identical(device_id, "g17")) {
+    rows <- NULL
+    
+    # ── Täglich ────────────────────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Täglich", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Kartenleser säubern"))
+    rows <- rbind(rows, mk_row(header = "", task = "2 PC'S morgens herunterfahren und wieder starten"))
+    rows <- rbind(rows, mk_row(header = "", task = "Kühlschranktemperaturen dokumentieren Annahme und Magazin"))
+    
+    # ── Wöchentlich (Mittwoch) ─────────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Wöchentlich (Mittwoch)", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Zentrifugen: Temperatursensor säubern Bestellung Magazin"))
+    
+    # ── Am ersten Freitag im Monat ───────────────────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Am ersten Freitag im Monat", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Zentrifugen: Reinigung und Desinfektion"))
+    
+    # ── Quartalsweise (Jan/April/Juli/Oktober) ──────────────────────────────
+    rows <- rbind(rows, mk_row(header = "Quartalsweise", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Zentrifugen: Tragbolzen fetten"))
+    
+    # ── Always-visible notes (not tied to a due-date schedule) ──────────────
+    rows <- rbind(rows, mk_row(header = "Druckerstatus aller Etikettendrucker 2X täglich kontrollieren (s. VA Etikettendrucker initialisieren)", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Tagdienst (morgens)"))
+    rows <- rbind(rows, mk_row(header = "", task = "Nachtdienst"))
+    
+    rows <- rbind(rows, mk_row(header = "O neg-Konserven werden 14 Tage vor dem Verfall an das DRK zurückgeschickt. Datum bitte markieren.", task = ""))
+    rows <- rbind(rows, mk_row(header = "", task = "Datum markieren"))
+    
+    rows <- rows[, c("Header", "Task", as.character(1:31)), drop = FALSE]
+    return(rows)
+  }
+  
   default_builder(c("Täglich", "Wöchentlich", "14-tägig", "Monatlich", "Bei Bedarf"),
                   c(3, 13, 3, 5, 4))
 }
@@ -1364,7 +1646,7 @@ load_device_table <- function(con, device_id) {
       save_device_table(con, "g1", df, "<system>")
     }
   }
-
+  
   # ---- COBAS Pro I (g4) / COBAS Pro II (g5) migration --------------------
   # Sync stored tables with the current template so newly added task texts
   # (Taeglich / Woechentlich / TD / 14-taegig / Monatlich / Elektrodenaustausch)
@@ -1376,7 +1658,7 @@ load_device_table <- function(con, device_id) {
     n_existing  <- nrow(df)
     n_template  <- nrow(df_template)
     needs_save  <- FALSE
-
+    
     # Inject template task texts only where the stored row currently has none.
     # Safe to run repeatedly: existing tasks are left untouched.
     n_min <- min(n_existing, n_template)
@@ -1394,7 +1676,7 @@ load_device_table <- function(con, device_id) {
         needs_save <- TRUE
       }
     }
-
+    
     # Append rows that exist in the template but are missing from the stored
     # table (e.g. new sections added later).
     if (n_template > n_existing) {
@@ -1405,13 +1687,13 @@ load_device_table <- function(con, device_id) {
       df <- rbind(df, extra)
       needs_save <- TRUE
     }
-
+    
     if (needs_save) {
       df <- order_cols(df)
       save_device_table(con, device_id, df, "<system>")
     }
   }
-
+  
   df
 }
 
@@ -1599,6 +1881,92 @@ load_remarks_for_date <- function(con, device_id, remark_date) {
   ", params = list(device_id, as.character(remark_date)))
 }
 
+# ---- Per-task metadata (e.g. "zuletzt getauscht am") ----------------------
+# Returns a named list (row_index -> Date) with the last-replaced date for
+# every task row that has one stored.
+load_task_meta_dates <- function(con, device_id) {
+  res <- DBI::dbGetQuery(con, "
+    SELECT row_index, last_replaced_date
+      FROM device_task_meta
+     WHERE device_id = $1
+  ", params = list(device_id))
+  out <- list()
+  if (!nrow(res)) return(out)
+  for (i in seq_len(nrow(res))) {
+    d <- res$last_replaced_date[i]
+    if (is.null(d) || is.na(d)) next
+    out[[ as.character(res$row_index[i]) ]] <- as.Date(d)
+  }
+  out
+}
+
+save_task_meta_date <- function(con, device_id, row_index, last_replaced_date, who) {
+  d <- if (is.null(last_replaced_date) || is.na(last_replaced_date)) NA_character_
+  else as.character(as.Date(last_replaced_date))
+  if (is.na(d)) {
+    DBI::dbExecute(con, "
+      DELETE FROM device_task_meta
+       WHERE device_id = $1 AND row_index = $2
+    ", params = list(device_id, row_index))
+    return(invisible())
+  }
+  DBI::dbExecute(con, "
+    INSERT INTO device_task_meta (device_id, row_index, last_replaced_date,
+                                  updated_by, updated_at)
+    VALUES ($1, $2, $3::date, $4, NOW())
+    ON CONFLICT (device_id, row_index) DO UPDATE
+      SET last_replaced_date = EXCLUDED.last_replaced_date,
+          updated_by         = EXCLUDED.updated_by,
+          updated_at         = NOW()
+  ", params = list(device_id, row_index, d, who))
+}
+
+# Detect tasks that end with "zuletzt getauscht am:" -> render a date input.
+is_last_replaced_task <- function(text) {
+  if (is.null(text) || is.na(text)) return(FALSE)
+  grepl("zuletzt\\s+getauscht\\s+am\\s*:", text, ignore.case = TRUE)
+}
+
+# Pull the replacement period in months from the task description, e.g.
+# "alle 2 Monate" -> 2L. Returns NA if no period is mentioned.
+extract_replacement_months <- function(text) {
+  if (is.null(text) || is.na(text)) return(NA_integer_)
+  m <- regmatches(text, regexpr("alle\\s+(\\d+)\\s+Monat", text, ignore.case = TRUE))
+  if (!length(m) || !nzchar(m)) return(NA_integer_)
+  as.integer(sub("\\D+", "", m))
+}
+
+# Compute the next due date for a "zuletzt getauscht am" replacement task.
+# Rule (per CL request): the replacement always happens on the FIRST Wednesday
+# of the target month (= last_replaced + period), shifted to the next workday
+# if that Wednesday is a public holiday. Returns NA if either input is missing.
+replacement_next_due <- function(last_replaced, months) {
+  last_replaced <- suppressWarnings(as.Date(last_replaced))
+  months        <- suppressWarnings(as.integer(months))
+  if (length(last_replaced) != 1L || is.na(last_replaced) ||
+      length(months) != 1L || is.na(months) || months <= 0L) return(as.Date(NA))
+  lt <- as.POSIXlt(last_replaced)
+  lt$mday <- 1L
+  lt$mon  <- lt$mon + months
+  target_month_first <- as.Date(lt)
+  wednesday_of_month(target_month_first, which = 1L)
+}
+
+# Snap a chosen date to the most appropriate working Wednesday in the same
+# calendar month (next Wednesday on/after `d`, falling back to previous
+# Wednesday if that overflows the month, then shifted past holidays).
+snap_to_working_wednesday <- function(d) {
+  d <- suppressWarnings(as.Date(d))
+  if (length(d) != 1L || is.na(d)) return(as.Date(NA))
+  iso <- as.integer(format(d, "%u"))
+  if (iso == 3L && is_workday(d)) return(d)
+  cand_fwd <- next_wednesday(d)
+  cand_bwd <- cand_fwd - 7L
+  pick <- if (as.integer(format(cand_fwd, "%m")) == as.integer(format(d, "%m")))
+    cand_fwd else cand_bwd
+  shift_to_next_workday(pick)
+}
+
 # All remarks (Bemerkungen) for one calendar month — used to surface
 # other users' comments in the Monatsübersicht table.
 load_remarks_for_month <- function(con, device_id, month, year) {
@@ -1682,7 +2050,7 @@ cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df
                                        read_only_all = FALSE,
                                        remarks_df = NULL) {
   df_show <- overlay_for_render(df, cell_status_df)
-
+  
   # German-friendly column headers:
   #   "Header" column -> blank label (only the cell's content matters)
   #   "Task"   column -> "Aufgabe"
@@ -1708,7 +2076,7 @@ cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df
       display_names[idx] <- paste0(de_wd[wd], " ", d)
     }
   }
-
+  
   rh <- rhandsontable(df_show, stretchH = "all") %>%
     # Color the Header column per schedule category (matches Tägliche Aufgaben tab)
     hot_col(
@@ -1725,12 +2093,27 @@ cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df
           // Schedule-category -> color (must mirror sched_styles in server)
           var map = {
             'Täglich':                       '#28a745',
+            'Täglich (ZL)':                  '#28a745',
+            'Täglich (Ablesen zwischen 12:00 und 14:00 Uhr)': '#28a745',
             'Montag und Donnerstag':         '#1e88e5',
             'Wöchentlich':                   '#0097a7',
+            'Wöchentlich (Montag)':          '#0097a7',
+            'Wöchentlich (Mittwoch)':        '#0097a7',
+            'Wöchentlich (Mittwoch, TD)':    '#0097a7',
+            'Wöchentlich (Donnerstag)':      '#0097a7',
+            'Wöchentlich (Freitag)':         '#0097a7',
+            'Wöchentlich (Freitag, ZL)':     '#0097a7',
             '14-tägig':                      '#5e35b1',
             'Monatlich':                     '#8e24aa',
+            'Monatlich (Freitag)':           '#8e24aa',
+            'Monatlich oder alle 2500 Proben': '#8e24aa',
             'Quartalsweise':                 '#ad1457',
+            'Alle 3 Monate oder alle 7500 Proben': '#ad1457',
             'Am ersten Dienstag im Monat':   '#7f0000',
+            'Am ersten Freitag im Monat':    '#00695c',
+            'Bei Bedarf':                    '#546e7a',
+            'Wartung bei Bedarf':            '#546e7a',
+            'Nach jeder Migration:':         '#546e7a',
             'Montag':                        '#bf360c',
             'Dienstag':                      '#bf360c',
             'Mittwoch':                      '#bf360c',
@@ -1755,8 +2138,8 @@ cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df
     hot_cols(columnSorting = TRUE, manualColumnResize = TRUE, colHeaders = display_names) %>%
     hot_table(highlightCol = TRUE, highlightRow = TRUE, rowHeaders = FALSE, comments = TRUE,
               readOnly = isTRUE(read_only_all))
-
-
+  
+  
   # Keep the rest: lock header ROWS for Task/day cells if you want them uneditable
   header_rows <- which(df_show$Header != "")
   if (length(header_rows)) {
@@ -1769,7 +2152,7 @@ cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df
       }
     }
   }
-
+  
   # lock invalid days (unchanged)
   if (length(invalid_days)) {
     for (d in as.character(invalid_days)) {
@@ -1780,7 +2163,7 @@ cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df
       }
     }
   }
-
+  
   # per-cell locks + comments (unchanged)
   # Build a quick lookup of remark text/option by (row_index, day) for this month
   remark_lookup <- new.env(hash = TRUE, parent = emptyenv())
@@ -1801,17 +2184,17 @@ cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df
       }
     }
   }
-
+  
   build_comment <- function(rr, dd_chr, base = NULL) {
     key <- paste0(rr, "_", as.integer(dd_chr))
     if (exists(key, envir = remark_lookup, inherits = FALSE)) {
       r <- get(key, envir = remark_lookup, inherits = FALSE)
       extra <- if (nzchar(r$label)) sprintf("Bemerkung von %s: %s", r$who, r$label)
-               else sprintf("Bemerkung von %s", r$who)
+      else sprintf("Bemerkung von %s", r$who)
       if (is.null(base) || !nzchar(base)) extra else paste(base, extra, sep = "\n")
     } else base
   }
-
+  
   seen_cells <- new.env(hash = TRUE, parent = emptyenv())
   if (!missing(cell_status_df) && nrow(cell_status_df)) {
     for (i in seq_len(nrow(cell_status_df))) {
@@ -1831,7 +2214,7 @@ cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df
       assign(paste0(rr, "_", as.integer(dd)), TRUE, envir = seen_cells)
     }
   }
-
+  
   # Remarks for cells that have no cell_status entry -> still show as comment
   if (!is.null(remarks_df) && nrow(remarks_df)) {
     for (i in seq_len(nrow(remarks_df))) {
@@ -1849,7 +2232,7 @@ cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df
       }
     }
   }
-
+  
   rh
 }
 
@@ -1956,6 +2339,28 @@ body <- dashboardBody(
       border-left: 4px solid #003B73;
     }
 
+    /* Click-to-expand section (currently used for the Cobas 8100 devices Bei Bedarf tasks): the header becomes a summary the user clicks to
+       reveal the tasks underneath instead of them always taking up space. */
+    .task-collapse { margin-bottom: 4px; }
+    .task-collapse > summary {
+      cursor: pointer;
+      list-style: none;
+      position: relative;
+    }
+    .task-collapse > summary::-webkit-details-marker { display: none; }
+    .task-collapse > summary .task-header::after {
+      content: \"▸\";
+      float: right;
+      font-size: 16px;
+      transition: transform 0.15s ease;
+    }
+    .task-collapse[open] > summary .task-header::after { transform: rotate(90deg); }
+    .task-collapse > summary .task-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
     .task-item {
       background: #f9f9f9;
       border-left: 3px solid #3c8dbc;
@@ -1995,9 +2400,9 @@ body <- dashboardBody(
     .task-checkbox { flex: 0 0 auto; padding-left: 12px; padding-right: 8px; }
     .task-checkbox .form-group { margin-bottom: 0; }
     .task-nicht    { flex: 0 0 auto; }
-    .task-select   { flex: 0 1 160px; min-width: 90px; }
+    .task-select   { flex: 0 1 220px; min-width: 140px; }
     .task-select .form-group { margin-bottom: 0; }
-    .task-remark   { flex: 1 1 160px; min-width: 0; display: flex; gap: 4px; align-items: center; }
+    .task-remark   { flex: 1 1 110px; min-width: 0; display: flex; gap: 4px; align-items: center; }
     .task-remark .form-group { margin-bottom: 0; flex: 1; min-width: 0; }
     .task-remark input[type=text] {
       font-size: 13px;
@@ -2481,8 +2886,8 @@ body <- dashboardBody(
       }
       .task-checkbox { flex: 0 0 auto; padding-left: 10px; padding-right: 4px; }
       .task-nicht    { flex: 0 0 auto; }
-      .task-select   { flex: 0 1 140px; min-width: 90px; }
-      .task-remark   { flex: 1 1 140px; min-width: 0; }
+      .task-select   { flex: 0 1 190px; min-width: 130px; }
+      .task-remark   { flex: 1 1 100px; min-width: 0; }
 
       /* Bigger tap targets for finger use. */
       .task-select select.form-control {
@@ -2814,7 +3219,7 @@ body <- dashboardBody(
       .hub-intro h2 { font-size: 22px; }
     }
   "))),
-
+  
   # JS: when a task dropdown is changed to "Nicht erledigt", highlight
   # the sibling Bemerkung box and focus it so the user is prompted to
   # type the reason.
@@ -2848,6 +3253,13 @@ body <- dashboardBody(
         if (el) { el.focus(); el.select && el.select(); }
       }, 60);
     });
+    // Bemerkung fields auto-save while typing (debounced, silent). We only
+    // want the save-confirmation toast once the user actually leaves the
+    // field, not on every typing pause, so track blur separately here.
+    $(document).on('blur', '.task-remark input[type=text]', function() {
+      var id = $(this).attr('id');
+      if (id) Shiny.setInputValue(id + '_blur', Math.random());
+    });
     // Server -> client: scroll to a task row in 'Taegliche Aufgaben' and
     // briefly highlight it so the user can find the affected Bemerkung.
     Shiny.addCustomMessageHandler('scrollToTaskRow', function(msg) {
@@ -2876,95 +3288,95 @@ body <- dashboardBody(
     });
   ")),
   
-
-
+  
+  
   conditionalPanel(
     condition = "!output.is_authed",
-
+    
     tags$div(class = "login-wrapper",
-      tags$div(class = "login-card",
-
-        # ---- Left: branding & app description ----
-        tags$div(class = "login-left",
-          tags$div(
-            tags$div(style = "display:flex; align-items:center; gap:12px; margin-bottom:18px;",
-              tags$div(style = "background:rgba(255,255,255,0.15); width:48px; height:48px; border-radius:12px; display:flex; align-items:center; justify-content:center;",
-                tags$i(class = "fa fa-tools", style = "font-size:22px; color:#ffd166;")
-              ),
-              tags$div(
-                tags$div(style = "font-size:11px; letter-spacing:2px; opacity:0.8; text-transform:uppercase;",
-                         "Diagnostikzentrum"),
-                tags$h2("Wartungsplan")
-              )
-            ),
-            tags$p(class = "subtitle",
-              "Digitale Wartungsplanung für die Geräte des Zentrallabors. ",
-              "Aufgaben dokumentieren, Verantwortlichkeiten nachvollziehen und ",
-              "Berichte erzeugen – an einem Ort."
-            ),
-            tags$ul(class = "feature-list",
-              tags$li(tags$i(class = "fa fa-th-large"),
-                      tags$span(tags$b("Übersicht: "),
-                                "Alle Geräte auf einen Blick mit offenen Aufgaben des Tages.")),
-              tags$li(tags$i(class = "fa fa-tasks"),
-                      tags$span(tags$b("Checkliste: "),
-                                "Tägliche Aufgaben abhaken und im Monatsplan dokumentieren.")),
-
-              tags$li(tags$i(class = "fa fa-file-pdf"),
-                      tags$span(tags$b("Export: "),
-                                "Monatsplan als PDF oder CSV herunterladen.")),
-
-              tags$li(tags$i(class = "fa fa-user-shield"),
-                      tags$span(tags$b("Sicher: "),
-                                "Persönlicher Zugang mit Initialen-Nachverfolgung pro Eintrag."))
-            )
-          ),
-          tags$div(class = "login-foot",
-            tags$i(class = "fa fa-info-circle"), " ",
-            "Bei Fragen oder Zugangsproblemen wenden Sie sich an ",
-            tags$b("Yadwinder"), ", ", tags$b("Frank"), " oder ", tags$b("Martina"), "."
-          )
-        ),
-
-        # ---- Right: login form ----
-        tags$div(class = "login-right",
-          tags$h3("Willkommen zurück"),
-          tags$div(class = "login-sub",
-                   "Bitte melden Sie sich mit Ihrem Benutzernamen und Passwort an."),
-
-          textInput("login_user", "Benutzername",
-                    placeholder = "z. B. Ihre Initialen"),
-          passwordInput("login_pass", "Passwort",
-                        placeholder = "Bei Erstanmeldung leer lassen"),
-
-          tags$div(class = "forgot-row",
-                   actionLink("forgot_pw_link", "Passwort vergessen?")),
-
-          actionButton("login_btn",
-                       label = tagList(tags$i(class = "fa fa-sign-in-alt"),
-                                       " Einloggen"),
-                       class = "btn btn-login"),
-
-          # Kurzanleitung Erstanmeldung
-          tags$div(class = "login-help",
-            tags$div(class = "login-help-title",
-              tags$i(class = "fa fa-key"),
-              "Erstanmeldung – so legen Sie Ihr Passwort fest"
-            ),
-            tags$ol(
-              tags$li("Benutzernamen eingeben (Initialen, die Ihnen mitgeteilt wurden)."),
-              tags$li("Passwortfeld ", tags$b("leer lassen"), " und auf ",
-                      tags$b("„Einloggen“"), " klicken."),
-              tags$li("Im erscheinenden Feld zweimal ein neues Passwort ",
-                      "(min. 8 Zeichen) eingeben und speichern.")
-            )
-          ),
-
-          uiOutput("password_setup_panel")
-        )
-      )
+             tags$div(class = "login-card",
+                      
+                      # ---- Left: branding & app description ----
+                      tags$div(class = "login-left",
+                               tags$div(
+                                 tags$div(style = "display:flex; align-items:center; gap:12px; margin-bottom:18px;",
+                                          tags$div(style = "background:rgba(255,255,255,0.15); width:48px; height:48px; border-radius:12px; display:flex; align-items:center; justify-content:center;",
+                                                   tags$i(class = "fa fa-tools", style = "font-size:22px; color:#ffd166;")
+                                          ),
+                                          tags$div(
+                                            tags$div(style = "font-size:11px; letter-spacing:2px; opacity:0.8; text-transform:uppercase;",
+                                                     "Diagnostikzentrum"),
+                                            tags$h2("Wartungsplan")
+                                          )
+                                 ),
+                                 tags$p(class = "subtitle",
+                                        "Digitale Wartungsplanung für die Geräte des Zentrallabors. ",
+                                        "Aufgaben dokumentieren, Verantwortlichkeiten nachvollziehen und ",
+                                        "Berichte erzeugen – an einem Ort."
+                                 ),
+                                 tags$ul(class = "feature-list",
+                                         tags$li(tags$i(class = "fa fa-th-large"),
+                                                 tags$span(tags$b("Übersicht: "),
+                                                           "Alle Geräte auf einen Blick mit offenen Aufgaben des Tages.")),
+                                         tags$li(tags$i(class = "fa fa-tasks"),
+                                                 tags$span(tags$b("Checkliste: "),
+                                                           "Tägliche Aufgaben abhaken und im Monatsplan dokumentieren.")),
+                                         
+                                         tags$li(tags$i(class = "fa fa-file-pdf"),
+                                                 tags$span(tags$b("Export: "),
+                                                           "Monatsplan als PDF oder CSV herunterladen.")),
+                                         
+                                         tags$li(tags$i(class = "fa fa-user-shield"),
+                                                 tags$span(tags$b("Sicher: "),
+                                                           "Persönlicher Zugang mit Initialen-Nachverfolgung pro Eintrag."))
+                                 )
+                               ),
+                               tags$div(class = "login-foot",
+                                        tags$i(class = "fa fa-info-circle"), " ",
+                                        "Bei Fragen oder Zugangsproblemen wenden Sie sich an ",
+                                        tags$b("Yadwinder"), ", ", tags$b("Frank"), " oder ", tags$b("Martina"), "."
+                               )
+                      ),
+                      
+                      # ---- Right: login form ----
+                      tags$div(class = "login-right",
+                               tags$h3("Willkommen zurück"),
+                               tags$div(class = "login-sub",
+                                        "Bitte melden Sie sich mit Ihrem Benutzernamen und Passwort an."),
+                               
+                               textInput("login_user", "Benutzername",
+                                         placeholder = "z. B. Ihre Initialen"),
+                               passwordInput("login_pass", "Passwort",
+                                             placeholder = "Bei Erstanmeldung leer lassen"),
+                               
+                               tags$div(class = "forgot-row",
+                                        actionLink("forgot_pw_link", "Passwort vergessen?")),
+                               
+                               actionButton("login_btn",
+                                            label = tagList(tags$i(class = "fa fa-sign-in-alt"),
+                                                            " Einloggen"),
+                                            class = "btn btn-login"),
+                               
+                               # Kurzanleitung Erstanmeldung
+                               tags$div(class = "login-help",
+                                        tags$div(class = "login-help-title",
+                                                 tags$i(class = "fa fa-key"),
+                                                 "Erstanmeldung – so legen Sie Ihr Passwort fest"
+                                        ),
+                                        tags$ol(
+                                          tags$li("Benutzernamen eingeben (Initialen, die Ihnen mitgeteilt wurden)."),
+                                          tags$li("Passwortfeld ", tags$b("leer lassen"), " und auf ",
+                                                  tags$b("„Einloggen“"), " klicken."),
+                                          tags$li("Im erscheinenden Feld zweimal ein neues Passwort ",
+                                                  "(min. 8 Zeichen) eingeben und speichern.")
+                                        )
+                               ),
+                               
+                               uiOutput("password_setup_panel")
+                      )
+             )
     )
-
+    
   ),
   conditionalPanel(
     condition = "output.is_authed",
@@ -2976,15 +3388,15 @@ body <- dashboardBody(
               uiOutput("hub_buttons"),
               br(),br(),
               uiOutput("hub_table_area")
-
-
+              
+              
       ),
       tabItem(
         tabName = "checklist",
-
+        
         # Compact device header (always visible, slim)
         uiOutput("device_info_header_slim"),
-
+        
         # Tabbed interface for tasks and visualization (THIS is what the user
         # should see first when opening a device)
         tabsetPanel(
@@ -2994,33 +3406,17 @@ body <- dashboardBody(
               class = "left-panel",
               style = "flex: none; width: auto; height: calc(100vh - 200px); margin-top: 20px;",
               
-              # Date header
-              tags$div(class = "date-header", 
-                       icon("calendar-day"),
-                       " Tägliche Aufgaben"
-              ),
-              
-              # Stats bar
-              uiOutput("task_stats"),
-              
-              # Quick actions
-              # tags$div(
-              #   class = "quick-actions",
-              #   actionButton("mark_today", "✓ Alle erledigen", 
-              #                class = "btn btn-success btn-sm",
-              #                style = "width: 100%;"),
-              #   actionButton("refresh_tasks", "🔄 Aktualisieren", 
-              #                class = "btn btn-info btn-sm",
-              #                style = "width: 100%;")
-              # ),
-              # 
-              tags$hr(),
-              
-              # Admin-only: add a new task to any device
-              uiOutput("admin_add_task_box"),
-              
-              # Task list
-              uiOutput("today_tasks")
+              box(width = 12, collapsible = TRUE, collapsed = FALSE,
+                  title = "Tägliche Aufgaben",
+                  
+                  # Stats bar
+                  uiOutput("task_stats"),
+                  
+                  tags$hr(),
+                  
+                  # Task list
+                  uiOutput("today_tasks")
+              )
             )
           ),
           tabPanel(
@@ -3071,7 +3467,7 @@ body <- dashboardBody(
         
         # Device footer
         uiOutput("device_footer_ui"),
-
+        
         # Editable device info (collapsed at the bottom — admin / power-user only)
         tags$div(style = "margin-top: 30px;", uiOutput("device_info_area"))
       ),
@@ -3090,7 +3486,13 @@ body <- dashboardBody(
                 ),
                 column(width = 6,
                        box(width = 12, title = "Übersicht Header (global)", status = "primary", solidHeader = TRUE,
-                           helpText("Sie können ein Bild manuell in www/uploads/ ablegen und den Pfad in der DB unter app_images (id='hub_header') setzen, falls gewünscht.")
+                           textInput("hub_header_path", "Pfad zum Logo (relativ zu www/)",
+                                     placeholder = "hub-header.png"),
+                           helpText("Die Bilddatei muss bereits im www/-Ordner der App liegen ",
+                                    "(z. B. www/hub-header.png -> hier 'hub-header.png' eintragen, ",
+                                    "oder www/uploads/logo.png -> 'uploads/logo.png')."),
+                           actionButton("save_hub_header", "Logo-Pfad speichern (Admin)",
+                                        class = "btn btn-primary")
                        ),
                        # save controls for admin
                        uiOutput("layout_save_controls")
@@ -3102,6 +3504,12 @@ body <- dashboardBody(
                 )
               )
       ),
+      tabItem(tabName = "add_task",
+              h3("Neue Aufgabe hinzufügen"),
+              uiOutput("admin_add_task_box"),
+              uiOutput("admin_edit_task_box"),
+              uiOutput("admin_diag_box")
+      ),
       tabItem(tabName = "admin",
               uiOutput("admin_panel")
       )
@@ -3110,6 +3518,16 @@ body <- dashboardBody(
 )
 
 ui <- dashboardPage(header, sidebar, body, title = "Wartungsplan")
+
+# Run schema setup (table creation/migrations, device seeding, and the
+# one-off "force rebuild from template" deletes) exactly ONCE when the R
+# process starts -- NOT inside server(), which runs fresh for every new
+# browser session. Calling it per-session meant every single login wiped
+# and rebuilt every device's task-table row from the hardcoded template,
+# silently discarding any admin edits (add/edit/delete task) made since
+# the last login by anyone, and re-stamping updated_by/updated_at with
+# whichever session happened to trigger the rebuild first.
+ensure_schema()
 
 # ----------------------------- SERVER -----------------------------------------
 server <- function(input, output, session) {
@@ -3159,8 +3577,12 @@ server <- function(input, output, session) {
     switch(header,
            "Täglich"                       = TRUE,
            "Täglich (ZL)"                  = TRUE,
+           "Täglich (Ablesen zwischen 12:00 und 14:00 Uhr)" = TRUE,
            "Wöchentlich"                   = (today_wd == "Monday"),
            "Wöchentlich (Montag)"          = (today_wd == "Monday"),
+           "Wöchentlich (Mittwoch)"        = (today_wd == "Wednesday"),
+           "Wöchentlich (Mittwoch, TD)"    = (today_wd == "Wednesday"),
+           "Wöchentlich (Donnerstag)"      = (today_wd == "Thursday"),
            "Wöchentlich (Freitag)"         = (today_wd == "Friday"),
            "Wöchentlich (Freitag, ZL)"     = (today_wd == "Friday"),
            "14-tägig"                      = is_biweekly_monday(),
@@ -3177,10 +3599,106 @@ server <- function(input, output, session) {
            "Monatlich oder alle 2500 Proben" = is_due_28day_cycle(Sys.Date(), MONTHLY_CYCLE_ANCHOR),
            "Quartalsweise"                 = is_first_workday_of_quarter(),
            "Am ersten Dienstag im Monat"   = is_due_28day_cycle(Sys.Date(), TUESDAY_CYCLE_ANCHOR),
+           "Am ersten Freitag im Monat"    = is_due_28day_cycle(Sys.Date(), FRIDAY_CYCLE_ANCHOR),
            "Alle 3 Monate oder alle 7500 Proben" = is_first_workday_of_quarter(),
            "Nach jeder Migration:"         = TRUE,
            FALSE   # Bei Bedarf / Wartung bei Bedarf / unknown -> never auto-flagged
     )
+  }
+  
+  # Same logic as is_header_due_today() but for an arbitrary date `d`. Used by
+  # the "Vortagsaufgaben" banner to decide which schedule blocks were actually
+  # expected on the previous workday.
+  is_header_due_on <- function(header, d) {
+    d <- as.Date(d)
+    if (is.na(d)) return(FALSE)
+    # Locale-independent weekday detection: %u -> 1=Mon..7=Sun. Avoids the
+    # weekdays() trap where a German locale returns "Dienstag" and an English
+    # name lookup fails with "subscript out of bounds".
+    iso  <- as.integer(format(d, "%u"))
+    en   <- c("Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday")
+    wd_en <- if (!is.na(iso) && iso >= 1L && iso <= 7L) en[iso] else ""
+    
+    switch(header,
+           "Täglich"                       = TRUE,
+           "Täglich (ZL)"                  = TRUE,
+           "Täglich (Ablesen zwischen 12:00 und 14:00 Uhr)" = TRUE,
+           "Wöchentlich"                   = (wd_en == "Monday"),
+           "Wöchentlich (Montag)"          = (wd_en == "Monday"),
+           "Wöchentlich (Mittwoch)"        = (wd_en == "Wednesday"),
+           "Wöchentlich (Mittwoch, TD)"    = (wd_en == "Wednesday"),
+           "Wöchentlich (Donnerstag)"      = (wd_en == "Thursday"),
+           "Wöchentlich (Freitag)"         = (wd_en == "Friday"),
+           "Wöchentlich (Freitag, ZL)"     = (wd_en == "Friday"),
+           "14-tägig"                      = is_biweekly_monday(d),
+           "Montag und Donnerstag"         = (wd_en %in% c("Monday", "Thursday")),
+           "Montag"                        = (wd_en == "Monday"),
+           "Dienstag"                      = (wd_en == "Tuesday"),
+           "Mittwoch"                      = (wd_en == "Wednesday"),
+           "Donnerstag"                    = (wd_en == "Thursday"),
+           "Freitag"                       = (wd_en == "Friday"),
+           "Samstag"                       = (wd_en == "Saturday"),
+           "Sonntag"                       = (wd_en == "Sunday"),
+           "Monatlich"                     = is_due_28day_cycle(d, MONTHLY_CYCLE_ANCHOR),
+           "Monatlich (Freitag)"           = (wd_en == "Friday" && is_first_workday_of_month(d)),
+           "Monatlich oder alle 2500 Proben" = is_due_28day_cycle(d, MONTHLY_CYCLE_ANCHOR),
+           "Quartalsweise"                 = is_first_workday_of_quarter(d),
+           "Am ersten Dienstag im Monat"   = is_due_28day_cycle(d, TUESDAY_CYCLE_ANCHOR),
+           "Am ersten Freitag im Monat"    = is_due_28day_cycle(d, FRIDAY_CYCLE_ANCHOR),
+           "Alle 3 Monate oder alle 7500 Proben" = is_first_workday_of_quarter(d),
+           "Nach jeder Migration:"         = TRUE,
+           FALSE
+    )
+  }
+  
+  # Every header text that represents an actual schedule (used to decide,
+  # while scanning rv$data top to bottom, whether a header row starts a new
+  # schedule section or is just a device sub-grouping label that keeps
+  # whatever schedule was active above it). Kept in sync with the switch
+  # statements above and with the sched_styles map in the daily task list.
+  SCHEDULE_HEADER_NAMES <- c(
+    "Täglich", "Täglich (ZL)", "Täglich (Ablesen zwischen 12:00 und 14:00 Uhr)",
+    "Montag und Donnerstag",
+    "Wöchentlich", "Wöchentlich (Montag)", "Wöchentlich (Mittwoch)",
+    "Wöchentlich (Mittwoch, TD)",
+    "Wöchentlich (Donnerstag)", "Wöchentlich (Freitag)",
+    "Wöchentlich (Freitag, ZL)", "14-tägig",
+    "Monatlich", "Monatlich (Freitag)", "Monatlich oder alle 2500 Proben",
+    "Quartalsweise", "Alle 3 Monate oder alle 7500 Proben",
+    "Am ersten Dienstag im Monat", "Am ersten Freitag im Monat",
+    "Bei Bedarf", "Wartung bei Bedarf", "Nach jeder Migration:",
+    "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"
+  )
+  # Schedules with no real due date ("as needed") -- never due, never overdue.
+  SCHEDULE_HEADERS_NO_DUE_DATE <- c("Bei Bedarf", "Wartung bei Bedarf")
+  
+  # Whether a task under `header` is something the user is actually expected
+  # to act on for date `d` -- mirrors exactly what the daily checklist shows
+  # (see the skip_section logic in the main render loop): a real schedule
+  # that's due on `d`, or a non-schedule/always-visible header (device
+  # sub-heading, standalone note). "Bei Bedarf"/"Wartung bei Bedarf" never
+  # count here, since they have no due date and are shown purely for the
+  # user's own judgement, not because they're "open" for today.
+  is_task_relevant_on <- function(header, d) {
+    if (!nzchar(header)) return(FALSE)
+    if (!(header %in% SCHEDULE_HEADER_NAMES)) return(TRUE)
+    if (header %in% SCHEDULE_HEADERS_NO_DUE_DATE) return(FALSE)
+    isTRUE(is_header_due_on(header, d))
+  }
+  
+  # Most recent date <= d on which `header`'s schedule was due. Used to find
+  # the last time a (non-today) section should have been completed, so an
+  # unfinished task from that date is surfaced no matter how long ago it
+  # became due -- not just "yesterday". Returns NA if nothing found within
+  # max_lookback days (covers even the quarterly cadence with headroom).
+  last_due_on_or_before <- function(header, d, max_lookback = 400L) {
+    d <- as.Date(d)
+    if (is.na(d) || header %in% SCHEDULE_HEADERS_NO_DUE_DATE) return(as.Date(NA))
+    for (i in 0:max_lookback) {
+      cand <- d - i
+      if (isTRUE(is_header_due_on(header, cand))) return(cand)
+    }
+    as.Date(NA)
   }
   
   # Build the urgency badge tag shown next to a task name
@@ -3210,46 +3728,44 @@ server <- function(input, output, session) {
   # output$task_stats <- renderUI({
   #   req(rv$current_device, rv$data)
   #   today <- as.integer(format(Sys.Date(), "%d"))
-    
+  
   #   # Calculate statistics
   #   data_rows <- which(rv$data$Header == "")
   #   total_tasks <- length(data_rows)
-    
+  
   #   cs <- rv$table_status %||% data.frame()
   #   done_rows <- unique(cs$row_index[cs$day == today])
   #   completed_tasks <- length(done_rows)
   #   pending_tasks <- total_tasks - completed_tasks
   #   completion_pct <- if (total_tasks > 0) round((completed_tasks / total_tasks) * 100) else 0
-    
-    # tags$div(
-    #   class = "stats-bar",
-    #   tags$div(
-    #     class = "stat-box",
-    #     tags$span(class = "stat-number", total_tasks),
-    #     tags$span(class = "stat-label", "Gesamt")
-    #   ),
-    #   tags$div(
-    #     class = "stat-box",
-    #     style = "border-color: #00a65a;",
-    #     tags$span(class = "stat-number", style = "color: #00a65a;", completed_tasks),
-    #     tags$span(class = "stat-label", "Erledigt")
-    #   ),
-    #   tags$div(
-    #     class = "stat-box",
-    #     style = "border-color: #dc3545;",
-    #     tags$span(class = "stat-number", style = "color: #dc3545;", pending_tasks),
-    #     tags$span(class = "stat-label", "Offen")
-    #   ),
-    #   tags$div(
-    #     class = "stat-box",
-    #     style = "border-color: #3c8dbc;",
-    #     tags$span(class = "stat-number", style = "color: #3c8dbc;", paste0(completion_pct, "%")),
-    #     tags$span(class = "stat-label", "Fortschritt")
-    #   )
-    # )
-  # })
   
-  ensure_schema()
+  # tags$div(
+  #   class = "stats-bar",
+  #   tags$div(
+  #     class = "stat-box",
+  #     tags$span(class = "stat-number", total_tasks),
+  #     tags$span(class = "stat-label", "Gesamt")
+  #   ),
+  #   tags$div(
+  #     class = "stat-box",
+  #     style = "border-color: #00a65a;",
+  #     tags$span(class = "stat-number", style = "color: #00a65a;", completed_tasks),
+  #     tags$span(class = "stat-label", "Erledigt")
+  #   ),
+  #   tags$div(
+  #     class = "stat-box",
+  #     style = "border-color: #dc3545;",
+  #     tags$span(class = "stat-number", style = "color: #dc3545;", pending_tasks),
+  #     tags$span(class = "stat-label", "Offen")
+  #   ),
+  #   tags$div(
+  #     class = "stat-box",
+  #     style = "border-color: #3c8dbc;",
+  #     tags$span(class = "stat-number", style = "color: #3c8dbc;", paste0(completion_pct, "%")),
+  #     tags$span(class = "stat-label", "Fortschritt")
+  #   )
+  # )
+  # })
   
   rv <- reactiveValues(
     role = "user",
@@ -3263,6 +3779,7 @@ server <- function(input, output, session) {
     table_status = data.frame(),
     invalid_days = integer(),
     task_obs_ids = character(0),
+    prev_task_obs_ids = character(0),
     tasks_refresh = 0L,
     pending_remarks = NULL
   )
@@ -3323,7 +3840,7 @@ server <- function(input, output, session) {
     "Wie hieß Ihre Grundschule?"                               = "primary_school",
     "Eigene Frage definieren …"                                = "__custom__"
   )
-
+  
   output$password_setup_panel <- renderUI({
     if (!isTRUE(rv$must_reset) || is.null(rv$user)) return(NULL)
     box(width = 12, title = "Passwort festlegen", status = "warning", solidHeader = TRUE,
@@ -3349,13 +3866,13 @@ server <- function(input, output, session) {
                      class = "btn btn-primary")
     )
   })
-
+  
   # Helper: normalize a security answer (lowercase, trim, collapse spaces)
   normalize_answer <- function(x) {
     x <- tolower(trimws(x %||% ""))
     gsub("\\s+", " ", x)
   }
-
+  
   observeEvent(input$set_pass_btn, {
     req(input$new_pass, input$new_pass2, rv$user)
     if (nchar(input$new_pass) < 8) {
@@ -3364,7 +3881,7 @@ server <- function(input, output, session) {
     if (input$new_pass != input$new_pass2) {
       showNotification("Passwörter stimmen nicht überein.", type = "error"); return()
     }
-
+    
     # Resolve security question label
     q_key <- input$sec_q_choice %||% ""
     q_label <- if (identical(q_key, "__custom__")) {
@@ -3383,7 +3900,7 @@ server <- function(input, output, session) {
       showNotification("Bitte geben Sie eine sinnvolle Antwort (min. 2 Zeichen).",
                        type = "error"); return()
     }
-
+    
     con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
     ph    <- bcrypt::hashpw(input$new_pass)
     a_h   <- bcrypt::hashpw(ans)
@@ -3396,17 +3913,17 @@ server <- function(input, output, session) {
              security_answer_hash = $3
        WHERE username = $4
     ", params = list(ph, q_label, a_h, rv$user))
-
+    
     rv$authed <- TRUE; rv$must_reset <- FALSE
     showNotification("Passwort und Sicherheitsfrage gespeichert. Willkommen!",
                      type = "message")
     updateTabItems(session, "tabs", "hub")
     show_due_tasks_dialog()
   })
-
+  
   # ---- Passwort vergessen: zweistufiger Dialog mit Sicherheitsfrage ----
   forgot_state <- reactiveValues(user = NULL, question = NULL)
-
+  
   observeEvent(input$forgot_pw_link, {
     forgot_state$user <- NULL
     forgot_state$question <- NULL
@@ -3422,7 +3939,7 @@ server <- function(input, output, session) {
       easyClose = TRUE
     ))
   })
-
+  
   observeEvent(input$forgot_lookup, {
     uname <- trimws(input$forgot_user %||% "")
     if (!nzchar(uname)) {
@@ -3430,8 +3947,8 @@ server <- function(input, output, session) {
     }
     con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
     u <- dbGetQuery(con,
-      "SELECT username, security_question FROM app_users WHERE username=$1",
-      params = list(uname))
+                    "SELECT username, security_question FROM app_users WHERE username=$1",
+                    params = list(uname))
     if (!nrow(u)) {
       showNotification("Benutzer nicht gefunden.", type = "error"); return()
     }
@@ -3466,7 +3983,7 @@ server <- function(input, output, session) {
       easyClose = TRUE
     ))
   })
-
+  
   observeEvent(input$forgot_confirm, {
     uname <- forgot_state$user
     if (is.null(uname) || !nzchar(uname)) { removeModal(); return() }
@@ -3476,8 +3993,8 @@ server <- function(input, output, session) {
     }
     con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
     u <- dbGetQuery(con,
-      "SELECT security_answer_hash FROM app_users WHERE username=$1",
-      params = list(uname))
+                    "SELECT security_answer_hash FROM app_users WHERE username=$1",
+                    params = list(uname))
     if (!nrow(u) || is.na(u$security_answer_hash[1])) {
       showNotification("Sicherheitsfrage konnte nicht überprüft werden.", type = "error"); return()
     }
@@ -3515,12 +4032,13 @@ server <- function(input, output, session) {
     }
     if (is_admin) {
       items <- c(items, list(
+        menuItem("Neue Aufgabe hinzufügen (Admin)", tabName = "add_task", icon = icon("plus")),
         menuItem("Admin", tabName = "admin", icon = icon("user-shield"))
       ))
     }
     do.call(sidebarMenu, c(list(id = "tabs"), items))
   })
-
+  
   # ---- Logout button (top-right in header) ----
   output$logout_ui <- renderUI({
     if (!isTRUE(rv$authed)) return(NULL)
@@ -3535,7 +4053,7 @@ server <- function(input, output, session) {
       )
     )
   })
-
+  
   observeEvent(input$logout_btn, {
     rv$authed        <- FALSE
     rv$must_reset    <- TRUE
@@ -3552,12 +4070,12 @@ server <- function(input, output, session) {
     showNotification("Sie wurden abgemeldet.", type = "message")
     session$reload()
   })
-
+  
   # ---- Admin panel: user management ------------------------------------------
   # Reactive trigger to refresh the user list after add/delete/role/reset actions
   admin_refresh <- reactiveVal(0)
   bump_admin_refresh <- function() admin_refresh(isolate(admin_refresh()) + 1L)
-
+  
   load_app_users_df <- function() {
     con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
     DBI::dbGetQuery(con, "
@@ -3571,7 +4089,7 @@ server <- function(input, output, session) {
       ORDER BY username
     ")
   }
-
+  
   output$admin_panel <- renderUI({
     req(rv$authed)
     if (!identical(rv$role, "admin")) {
@@ -3580,43 +4098,43 @@ server <- function(input, output, session) {
     }
     fluidRow(
       column(width = 12,
-        box(width = 12, title = "Neuen Benutzer anlegen", status = "success", solidHeader = TRUE,
-          fluidRow(
-            column(3, textInput("admin_new_user", "Benutzername (Login)",
-                                placeholder = "z. B. mmus")),
-            column(3, textInput("admin_new_initials", "Initialen",
-                                placeholder = "2-5 Kleinbuchstaben")),
-            column(2, selectInput("admin_new_role", "Rolle",
-                                  choices = c("user", "admin"), selected = "user")),
-            column(4,
-              br(),
-              actionButton("admin_add_user", "Benutzer hinzufügen",
-                           class = "btn btn-success", icon = icon("user-plus"))
-            )
-          ),
-          helpText("Der neue Benutzer hat noch kein Passwort und wird beim ersten Login aufgefordert, eines festzulegen.")
-        ),
-        box(width = 12, title = "Benutzer verwalten", status = "primary", solidHeader = TRUE,
-          tableOutput("admin_users_table"),
-          hr(),
-          fluidRow(
-            column(4, uiOutput("admin_user_select_ui")),
-            column(8,
-              br(),
-              actionButton("admin_toggle_role", "Rolle umschalten (admin/user)",
-                           class = "btn btn-warning", icon = icon("user-shield")),
-              actionButton("admin_reset_pw", "Passwort zurücksetzen",
-                           class = "btn btn-info", icon = icon("key")),
-              actionButton("admin_delete_user", "Benutzer löschen",
-                           class = "btn btn-danger", icon = icon("user-times"))
-            )
-          ),
-          helpText("Hinweis: Sie können Ihren eigenen Account nicht löschen oder degradieren.")
-        )
+             box(width = 12, title = "Neuen Benutzer anlegen", status = "success", solidHeader = TRUE,
+                 fluidRow(
+                   column(3, textInput("admin_new_user", "Benutzername (Login)",
+                                       placeholder = "z. B. mmus")),
+                   column(3, textInput("admin_new_initials", "Initialen",
+                                       placeholder = "2-5 Kleinbuchstaben")),
+                   column(2, selectInput("admin_new_role", "Rolle",
+                                         choices = c("user", "admin"), selected = "user")),
+                   column(4,
+                          br(),
+                          actionButton("admin_add_user", "Benutzer hinzufügen",
+                                       class = "btn btn-success", icon = icon("user-plus"))
+                   )
+                 ),
+                 helpText("Der neue Benutzer hat noch kein Passwort und wird beim ersten Login aufgefordert, eines festzulegen.")
+             ),
+             box(width = 12, title = "Benutzer verwalten", status = "primary", solidHeader = TRUE,
+                 tableOutput("admin_users_table"),
+                 hr(),
+                 fluidRow(
+                   column(4, uiOutput("admin_user_select_ui")),
+                   column(8,
+                          br(),
+                          actionButton("admin_toggle_role", "Rolle umschalten (admin/user)",
+                                       class = "btn btn-warning", icon = icon("user-shield")),
+                          actionButton("admin_reset_pw", "Passwort zurücksetzen",
+                                       class = "btn btn-info", icon = icon("key")),
+                          actionButton("admin_delete_user", "Benutzer löschen",
+                                       class = "btn btn-danger", icon = icon("user-times"))
+                   )
+                 ),
+                 helpText("Hinweis: Sie können Ihren eigenen Account nicht löschen oder degradieren.")
+             )
       )
     )
   })
-
+  
   output$admin_users_table <- renderTable({
     req(rv$authed, identical(rv$role, "admin"))
     admin_refresh()  # take a dependency
@@ -3633,7 +4151,7 @@ server <- function(input, output, session) {
       stringsAsFactors = FALSE
     )
   }, striped = TRUE, hover = TRUE, bordered = TRUE, spacing = "s", width = "100%")
-
+  
   output$admin_user_select_ui <- renderUI({
     req(rv$authed, identical(rv$role, "admin"))
     admin_refresh()
@@ -3641,8 +4159,8 @@ server <- function(input, output, session) {
     choices <- if (nrow(df)) df$username else character(0)
     selectInput("admin_target_user", "Benutzer auswählen", choices = choices)
   })
-
-  # ---- Add user
+  
+  # -------------------------- Add user-----------------------------------------
   observeEvent(input$admin_add_user, {
     req(rv$authed, identical(rv$role, "admin"))
     uname <- trimws(input$admin_new_user %||% "")
@@ -3659,7 +4177,7 @@ server <- function(input, output, session) {
     }
     if (!rolev %in% c("user", "admin")) rolev <- "user"
     if (!nzchar(inits)) inits <- substr(tolower(uname), 1, 5)
-
+    
     con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
     exists <- DBI::dbGetQuery(con, "SELECT 1 FROM app_users WHERE username=$1", params = list(uname))
     if (nrow(exists)) {
@@ -3679,7 +4197,7 @@ server <- function(input, output, session) {
       showNotification(paste("Fehler beim Anlegen:", conditionMessage(e)), type = "error")
     })
   })
-
+  
   # ---- Delete user (with confirmation)
   observeEvent(input$admin_delete_user, {
     req(rv$authed, identical(rv$role, "admin"))
@@ -3700,7 +4218,7 @@ server <- function(input, output, session) {
       easyClose = TRUE
     ))
   })
-
+  
   observeEvent(input$admin_delete_confirm, {
     req(rv$authed, identical(rv$role, "admin"))
     target <- input$admin_target_user
@@ -3718,7 +4236,7 @@ server <- function(input, output, session) {
       showNotification(paste("Fehler beim Löschen:", conditionMessage(e)), type = "error")
     })
   })
-
+  
   # ---- Toggle role admin <-> user
   observeEvent(input$admin_toggle_role, {
     req(rv$authed, identical(rv$role, "admin"))
@@ -3731,8 +4249,8 @@ server <- function(input, output, session) {
     }
     con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
     cur <- DBI::dbGetQuery(con,
-      "SELECT COALESCE(role,'user') AS role FROM app_users WHERE username=$1",
-      params = list(target))
+                           "SELECT COALESCE(role,'user') AS role FROM app_users WHERE username=$1",
+                           params = list(target))
     if (!nrow(cur)) {
       showNotification("Benutzer nicht gefunden.", type = "error"); return()
     }
@@ -3743,7 +4261,7 @@ server <- function(input, output, session) {
     showNotification(sprintf("Rolle von '%s' ist jetzt '%s'.", target, new_role),
                      type = "message")
   })
-
+  
   # ---- Reset password (force user to set a new one on next login)
   observeEvent(input$admin_reset_pw, {
     req(rv$authed, identical(rv$role, "admin"))
@@ -3757,7 +4275,7 @@ server <- function(input, output, session) {
     showNotification(sprintf("Passwort für '%s' zurückgesetzt. Beim nächsten Login wird ein neues verlangt.", target),
                      type = "message")
   })
-
+  
   # ---- Overview (hub) header image render ----
   output$hub_header_image <- renderUI({
     # read global hub header image path from DB
@@ -3775,6 +4293,7 @@ server <- function(input, output, session) {
   observe({
     con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
     devices <- DBI::dbGetQuery(con, "SELECT device_id, label FROM devices ORDER BY device_id")
+    devices <- devices[!(devices$device_id %in% RETIRED_DEVICE_IDS), , drop = FALSE]
     if (nrow(devices)) {
       choices <- setNames(devices$device_id, devices$label)
       updateSelectInput(session, "layout_device", choices = choices, selected = devices$device_id[1])
@@ -3813,45 +4332,149 @@ server <- function(input, output, session) {
     }
   })
   
+  # Pre-fill the global header-logo path field with whatever is currently set.
+  observeEvent(input$tabs, {
+    if (!identical(input$tabs, "layout")) return()
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    l <- load_app_image(con, id = "hub_header")
+    updateTextInput(session, "hub_header_path", value = l$img_path %||% "")
+  })
+  
+  # ---- Save global header logo path (admin-only) ----
+  observeEvent(input$save_hub_header, {
+    req(rv$authed)
+    if (is.null(rv$role) || rv$role != "admin") {
+      showNotification("Nur Admins können das Logo ändern.", type = "error"); return()
+    }
+    path <- trimws(input$hub_header_path %||% "")
+    if (!nzchar(path)) {
+      showNotification("Bitte einen Pfad angeben (z. B. 'hub-header.png').", type = "error"); return()
+    }
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    tryCatch({
+      save_app_image(con, id = "hub_header", img_path = path, who = rv$user %||% "system")
+      showNotification(sprintf("Logo-Pfad gespeichert: %s", path), type = "message")
+    }, error = function(e) {
+      showNotification(paste("Fehler beim Speichern:", conditionMessage(e)), type = "error")
+    })
+  })
+  
   # ---- Übersicht (hub) ----
   count_open_today <- function(con, device_id, df) {
     if (is.null(df) || !nrow(df)) return(0L)
-    data_rows <- which(df$Header == "")
+    today <- Sys.Date()
+    hdrs  <- as.character(df$Header)
+    tasks <- if ("Task" %in% names(df)) as.character(df$Task) else rep("", nrow(df))
+    cur_hdr <- ""
+    data_rows <- integer(0)
+    for (i in seq_len(nrow(df))) {
+      h <- hdrs[i]
+      if (nzchar(h)) { cur_hdr <- h; next }
+      if (!nzchar(tasks[i])) next
+      if (is_task_relevant_on(cur_hdr, today)) data_rows <- c(data_rows, i)
+    }
     if (!length(data_rows)) return(0L)
-    cur_m <- as.integer(format(Sys.Date(), "%m"))
-    cur_y <- as.integer(format(Sys.Date(), "%Y"))
+    cur_m <- as.integer(format(today, "%m"))
+    cur_y <- as.integer(format(today, "%Y"))
     cs <- load_cell_status(con, device_id, cur_m, cur_y)
-    today <- as.integer(format(Sys.Date(), "%d"))
-    done_rows <- unique(cs$row_index[cs$day == today])
+    today_day <- as.integer(format(today, "%d"))
+    done_rows <- unique(cs$row_index[cs$day == today_day])
     sum(!(data_rows %in% done_rows))
   }
-
+  
+  # Same idea but for yesterday's calendar day (handles month/year rollover).
+  count_open_yesterday <- function(con, device_id, df) {
+    if (is.null(df) || !nrow(df)) return(0L)
+    yd    <- Sys.Date() - 1L
+    hdrs  <- as.character(df$Header)
+    tasks <- if ("Task" %in% names(df)) as.character(df$Task) else rep("", nrow(df))
+    cur_hdr <- ""
+    data_rows <- integer(0)
+    for (i in seq_len(nrow(df))) {
+      h <- hdrs[i]
+      if (nzchar(h)) { cur_hdr <- h; next }
+      if (!nzchar(tasks[i])) next
+      if (is_task_relevant_on(cur_hdr, yd)) data_rows <- c(data_rows, i)
+    }
+    if (!length(data_rows)) return(0L)
+    y_d <- as.integer(format(yd, "%d"))
+    y_m <- as.integer(format(yd, "%m"))
+    y_y <- as.integer(format(yd, "%Y"))
+    cs <- load_cell_status(con, device_id, y_m, y_y)
+    done_rows <- unique(cs$row_index[cs$day == y_d])
+    sum(!(data_rows %in% done_rows))
+  }
+  
   # Build a summary of devices with open tasks for today.
-  # Returns a data.frame with columns: device_id, label, open_count
+  # Returns a data.frame with columns: device_id, label, open_count,
+  # open_count_yesterday.
+  # Devices no longer in service. They may still physically exist in the
+  # `devices` table if the DELETE in ensure_schema() was blocked by a
+  # foreign-key reference to old historical data -- excluding them here
+  # too means "Geräte gesamt" / "Geräte betroffen" are correct either way,
+  # instead of depending on that delete having actually succeeded.
+  RETIRED_DEVICE_IDS <- c("g12", "g13", "g14")
+  
   compute_due_today <- function() {
     con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
     devs <- DBI::dbGetQuery(con, "SELECT device_id, label FROM devices ORDER BY device_id")
-    if (!nrow(devs)) return(devs)
-    devs$open_count <- vapply(seq_len(nrow(devs)), function(i) {
+    devs <- devs[!(devs$device_id %in% RETIRED_DEVICE_IDS), , drop = FALSE]
+    if (!nrow(devs)) {
+      devs$open_count <- integer(0)
+      devs$open_count_yesterday <- integer(0)
+      return(devs)
+    }
+    counts <- lapply(seq_len(nrow(devs)), function(i) {
       did <- devs$device_id[i]
       df_tmp <- tryCatch(load_device_table(con, did) %||% create_initial_table(did),
                          error = function(e) NULL)
-      tryCatch(as.integer(count_open_today(con, did, df_tmp)),
-               error = function(e) 0L)
-    }, integer(1))
+      list(
+        today     = tryCatch(as.integer(count_open_today(con, did, df_tmp)),
+                             error = function(e) 0L),
+        yesterday = tryCatch(as.integer(count_open_yesterday(con, did, df_tmp)),
+                             error = function(e) 0L)
+      )
+    })
+    devs$open_count           <- vapply(counts, `[[`, integer(1), "today")
+    devs$open_count_yesterday <- vapply(counts, `[[`, integer(1), "yesterday")
     devs
   }
-
+  
   # Show a friendly modal listing devices with open tasks today.
   # Each device with open tasks gets a button that opens its checklist.
   show_due_tasks_dialog <- function() {
     devs <- tryCatch(compute_due_today(), error = function(e) NULL)
     if (is.null(devs) || !nrow(devs)) return(invisible(NULL))
-
-    open_devs <- devs[devs$open_count > 0, , drop = FALSE]
+    
+    if (is.null(devs$open_count_yesterday))
+      devs$open_count_yesterday <- 0L
+    open_devs <- devs[devs$open_count > 0 | devs$open_count_yesterday > 0,
+                      , drop = FALSE]
+    if (!nrow(open_devs)) return(invisible(NULL))
+    
+    # Fingerprint of exactly what would be shown today; if the user already
+    # acknowledged this same set today, skip the popup so it doesn't repeat
+    # on every login. A change in the open tasks (new device, higher count)
+    # yields a different fingerprint, so it surfaces again.
+    fp_src <- paste(sort(paste0(open_devs$device_id, ":", open_devs$open_count,
+                                ":", open_devs$open_count_yesterday)),
+                    collapse = "|")
+    fingerprint <- paste0(Sys.Date(), "#", fp_src)
+    already_acked <- tryCatch({
+      con_a <- pg_con(); on.exit(dbDisconnect(con_a), add = TRUE)
+      ack <- dbGetQuery(con_a,
+                        "SELECT fingerprint FROM due_dialog_ack WHERE ack_date = $1",
+                        params = list(as.character(Sys.Date())))
+      nrow(ack) && identical(ack$fingerprint[1], fingerprint)
+    }, error = function(e) FALSE)
+    if (isTRUE(already_acked)) return(invisible(NULL))
+    rv$due_dialog_fingerprint <- fingerprint
+    
     today_str <- to_german_date_str(format(Sys.Date(), "%A, %d.%m.%Y"))
+    yesterday_str <- to_german_date_str(format(Sys.Date() - 1L, "%A, %d.%m.%Y"))
     total_open <- sum(open_devs$open_count)
-
+    total_yest <- sum(open_devs$open_count_yesterday)
+    
     # Shared CSS for the modal (injected once via the dialog body)
     modal_css <- tags$style(HTML("
       .due-modal .modal-content {
@@ -3884,6 +4507,7 @@ server <- function(input, output, session) {
       }
       .due-hero .hero-title {
         font-size: 20px; font-weight: 800; line-height: 1.15; margin: 0;
+        color: #fff;
       }
       .due-hero .hero-sub {
         font-size: 12px; opacity: 0.9; letter-spacing: .8px;
@@ -3899,6 +4523,10 @@ server <- function(input, output, session) {
         font-size: 13px; font-weight: 600;
       }
       .due-hero .hero-pill b { font-size: 15px; }
+      .due-hero .hero-pill-warn {
+        background: rgba(255, 193, 7, 0.28);
+        border: 1px solid rgba(255, 235, 59, 0.55);
+      }
 
       .due-body { padding: 18px 22px 8px 22px; background: #fafbfc; }
       .due-body .due-list-title {
@@ -3963,6 +4591,16 @@ server <- function(input, output, session) {
       .due-card .due-meta {
         font-size: 11px; color: #6c757d;
       }
+      .due-card .due-yest-badge {
+        display: inline-flex; align-items: center; gap: 4px;
+        margin-top: 4px;
+        background: #fff8e1;
+        color: #8d6e00;
+        border: 1px solid #ffe082;
+        border-radius: 999px;
+        padding: 2px 10px;
+        font-size: 11px; font-weight: 700;
+      }
       .due-card .btn-open {
         background: #003B73; color: #fff; border: none;
         font-weight: 600; font-size: 12px;
@@ -3984,67 +4622,80 @@ server <- function(input, output, session) {
       }
       .due-foot .btn-later:hover { background:#f1f3f5; }
     "))
-
+    
     if (!nrow(open_devs)) {
       showModal(modalDialog(
         size = "m", easyClose = TRUE, footer = NULL,
         class = "due-modal",
         modal_css,
         tags$div(class = "due-hero ok",
-          tags$div(class = "hero-row",
-            tags$div(class = "hero-icon", icon("check")),
-            tags$div(
-              tags$div(class = "hero-sub", today_str),
-              tags$h3(class = "hero-title", "Alles erledigt!")
-            )
-          ),
-          tags$p(style = "margin: 14px 0 0 0; opacity: 0.95;",
-                 "Für heute sind keine offenen Wartungsaufgaben vorhanden. ",
-                 "Schöner Tag!")
+                 tags$div(class = "hero-row",
+                          tags$div(class = "hero-icon", icon("check")),
+                          tags$div(
+                            tags$div(class = "hero-sub", today_str),
+                            tags$h3(class = "hero-title", "Alles erledigt!")
+                          )
+                 ),
+                 tags$p(style = "margin: 14px 0 0 0; opacity: 0.95;",
+                        "Für heute sind keine offenen Wartungsaufgaben vorhanden. ",
+                        "Schöner Tag!")
         ),
         tags$div(class = "due-foot",
-          tags$div(class = "foot-hint",
-                   icon("info-circle"), " Sie können diese Übersicht später jederzeit öffnen."),
-          modalButton("Schließen") |> tagAppendAttributes(class = "btn-later")
+                 tags$div(class = "foot-hint",
+                          icon("info-circle"), " Sie können diese Übersicht später jederzeit öffnen."),
+                 modalButton("Schließen") |> tagAppendAttributes(class = "btn-later")
         )
       ))
       return(invisible(NULL))
     }
-
+    
     # ── Arbeitsplatz definitions (mirrors hub_buttons) ──────────────────────
     arbeitsplaetze <- list(
       list(name = "Arbeitsplatz 1 \u2013 H\u00e4matologie",
            icon = "tint",
-           devices = c("g7", "g12", "g13", "g14", "g15")),
+           devices = c("g7", "g15")),
       list(name = "Arbeitsplatz 2 \u2013 Gerinnung",
            icon = "wave-square",
-           devices = c("g1", "g6", "g11")),
+           devices = c("g1", "g6", "g16", "g11")),
       list(name = "Arbeitsplatz 3 \u2013 Klinische Chemie",
            icon = "flask",
-           devices = c("g3", "g4", "g5", "g9")),
+           devices = c("g4", "g5", "g9")),
       list(name = "Arbeitsplatz 4 \u2013 Immunologie / Allergie",
            icon = "shield-alt",
-           devices = c("g2", "g8", "g10"))
+           devices = c("g2", "g8", "g10")),
+      list(name = "Arbeitsplatz 5 \u2013 Cobas 8100",
+           icon = "vial", 
+           devices = c("g3", "g17") 
+      )
     )
-
-    make_dev_card <- function(did, lbl, cnt) {
+    
+    make_dev_card <- function(did, lbl, cnt, cnt_y = 0L) {
+      meta_today <- if (cnt > 0)
+        sprintf("%d offene Aufgabe%s heute", cnt, ifelse(cnt == 1, "", "n"))
+      else NULL
+      meta_yest <- if (isTRUE(cnt_y > 0))
+        sprintf("%d offen seit gestern", cnt_y)
+      else NULL
+      meta <- paste(c(meta_today, meta_yest), collapse = " \u00b7 ")
       tags$div(class = "due-card",
-        tags$div(class = "due-info",
-          tags$div(class = "due-count", cnt),
-          tags$div(
-            tags$div(class = "due-name", lbl),
-            tags$div(class = "due-meta",
-                     sprintf("%d offene Aufgabe%s", cnt, ifelse(cnt == 1, "", "n")))
-          )
-        ),
-        actionButton(
-          inputId = paste0("due_open_", did),
-          label   = tagList(icon("arrow-right"), " \u00d6ffnen"),
-          class   = "btn-open"
-        )
+               tags$div(class = "due-info",
+                        tags$div(
+                          tags$div(class = "due-name", lbl),
+                          tags$div(class = "due-meta", meta),
+                          if (isTRUE(cnt_y > 0))
+                            tags$div(class = "due-yest-badge",
+                                     icon("clock-rotate-left"),
+                                     sprintf(" Gestern noch %d offen", cnt_y))
+                        )
+               ),
+               actionButton(
+                 inputId = paste0("due_open_", did),
+                 label   = tagList(icon("arrow-right"), " \u00d6ffnen"),
+                 class   = "btn-open"
+               )
       )
     }
-
+    
     # Build one section per Arbeitsplatz (only if it has open devices today)
     assigned_ids <- unlist(lapply(arbeitsplaetze, `[[`, "devices"))
     ap_sections <- lapply(arbeitsplaetze, function(ap) {
@@ -4053,89 +4704,128 @@ server <- function(input, output, session) {
       ord <- match(ap$devices, sub$device_id)
       sub <- sub[ord[!is.na(ord)], , drop = FALSE]
       ap_total <- sum(sub$open_count)
+      ap_yest  <- sum(sub$open_count_yesterday)
       cards <- lapply(seq_len(nrow(sub)), function(i)
-        make_dev_card(sub$device_id[i], sub$label[i], sub$open_count[i]))
+        make_dev_card(sub$device_id[i], sub$label[i], sub$open_count[i],
+                      sub$open_count_yesterday[i]))
       tags$div(class = "due-ap-group",
-        tags$div(class = "due-ap-title",
-          tags$span(class = "due-ap-icon", icon(ap$icon)),
-          tags$span(ap$name),
-          tags$span(class = "due-ap-count",
-                    sprintf("%d offen", ap_total))
-        ),
-        cards
+               tags$div(class = "due-ap-title",
+                        tags$span(class = "due-ap-icon", icon(ap$icon)),
+                        tags$span(ap$name),
+                        tags$span(class = "due-ap-count",
+                                  paste0(
+                                    sprintf("%d offen", ap_total),
+                                    if (ap_yest > 0) sprintf(" \u00b7 %d seit gestern", ap_yest) else ""
+                                  ))
+               ),
+               cards
       )
     })
-
+    
     # Devices with open tasks that aren't mapped to any Arbeitsplatz
     leftover <- open_devs[!(open_devs$device_id %in% assigned_ids), , drop = FALSE]
     if (nrow(leftover)) {
       cards <- lapply(seq_len(nrow(leftover)), function(i)
-        make_dev_card(leftover$device_id[i], leftover$label[i], leftover$open_count[i]))
+        make_dev_card(leftover$device_id[i], leftover$label[i],
+                      leftover$open_count[i],
+                      leftover$open_count_yesterday[i]))
       ap_sections <- c(ap_sections, list(
         tags$div(class = "due-ap-group",
-          tags$div(class = "due-ap-title",
-            tags$span(class = "due-ap-icon", icon("microscope")),
-            tags$span("Weitere Ger\u00e4te"),
-            tags$span(class = "due-ap-count",
-                      sprintf("%d offen", sum(leftover$open_count)))
-          ),
-          cards
+                 tags$div(class = "due-ap-title",
+                          tags$span(class = "due-ap-icon", icon("microscope")),
+                          tags$span("Weitere Ger\u00e4te"),
+                          tags$span(class = "due-ap-count",
+                                    sprintf("%d offen", sum(leftover$open_count)))
+                 ),
+                 cards
         )
       ))
     }
     dev_rows <- Filter(Negate(is.null), ap_sections)
-
+    
     showModal(modalDialog(
       size = "m", easyClose = TRUE, footer = NULL,
       class = "due-modal",
       modal_css,
       tags$div(class = "due-hero alert",
-        tags$div(class = "hero-row",
-          tags$div(class = "hero-icon", icon("triangle-exclamation")),
-          tags$div(
-            tags$div(class = "hero-sub", today_str),
-            tags$h3(class = "hero-title", "Offene Wartungsaufgaben heute")
-          )
-        ),
-        tags$div(class = "hero-stats",
-          tags$div(class = "hero-pill",
-                   tags$b(total_open),
-                   sprintf(" Aufgabe%s offen", ifelse(total_open == 1, "", "n"))),
-          tags$div(class = "hero-pill",
-                   tags$b(nrow(open_devs)),
-                   sprintf(" Gerät%s betroffen", ifelse(nrow(open_devs) == 1, "", "e")))
-        )
+               tags$div(class = "hero-row",
+                        tags$div(class = "hero-icon", icon("triangle-exclamation")),
+                        tags$div(
+                          tags$div(class = "hero-sub", today_str),
+                          tags$h3(class = "hero-title", "Offene Wartungsaufgaben heute")
+                        )
+               ),
+               tags$div(class = "hero-stats",
+                        tags$div(class = "hero-pill",
+                                 tags$b(total_open),
+                                 sprintf(" Aufgabe%s offen heute", ifelse(total_open == 1, "", "n"))),
+                        tags$div(class = "hero-pill",
+                                 tags$b(nrow(open_devs)),
+                                 sprintf(" Gerät%s betroffen", ifelse(nrow(open_devs) == 1, "", "e"))),
+                        if (isTRUE(total_yest > 0))
+                          tags$div(class = "hero-pill hero-pill-warn",
+                                   icon("clock-rotate-left"), " ",
+                                   tags$b(total_yest),
+                                   sprintf(" Aufgabe%s noch offen von gestern",
+                                           ifelse(total_yest == 1, "", "n")))
+               )
       ),
       tags$div(class = "due-body",
-        tags$div(class = "due-list-title",
-                 icon("list-check"), " Offene Aufgaben \u2013 nach Arbeitsplatz"),
-        tags$div(class = "due-list", dev_rows)
+               tags$div(class = "due-list-title",
+                        icon("list-check"), " Offene Aufgaben \u2013 nach Arbeitsplatz"),
+               tags$div(class = "due-list", dev_rows)
       ),
       tags$div(class = "due-foot",
-        tags$div(class = "foot-hint",
-                 icon("hand-pointer"),
-                 " Klicken Sie auf „Öffnen“, um zur Checkliste zu springen."),
-        modalButton("Später") |> tagAppendAttributes(class = "btn-later")
+               tags$div(class = "foot-hint",
+                        icon("hand-pointer"),
+                        " Klicken Sie auf „Öffnen“, um zur Checkliste zu springen."),
+               tags$div(style = "display:flex; gap:8px;",
+                        actionButton("due_dialog_ack_btn",
+                                     label = tagList(icon("eye"), " Als gelesen markieren"),
+                                     class = "btn-later"),
+                        modalButton("Später") |> tagAppendAttributes(class = "btn-later")
+               )
       )
     ))
   }
   
-
-output$hub_intro <- renderUI({
+  # "Als gelesen markieren": remember today's fingerprint so the same open-
+  # tasks popup doesn't reappear on every subsequent login today.
+  observeEvent(input$due_dialog_ack_btn, {
+    fp <- isolate(rv$due_dialog_fingerprint)
+    if (nzchar(fp %||% "")) {
+      tryCatch({
+        con_a <- pg_con(); on.exit(dbDisconnect(con_a), add = TRUE)
+        dbExecute(con_a, "
+          INSERT INTO due_dialog_ack (ack_date, fingerprint, acked_by)
+          VALUES ($1, $2, $3)
+          ON CONFLICT (ack_date) DO UPDATE
+            SET fingerprint = EXCLUDED.fingerprint,
+                acked_by    = EXCLUDED.acked_by,
+                acked_at    = NOW()
+        ", params = list(as.character(Sys.Date()), fp, isolate(rv$user) %||% ""))
+      }, error = function(e) NULL)
+    }
+    removeModal()
+  })
+  
+  
+  output$hub_intro <- renderUI({
     req(rv$authed)
     who <- rv$user %||% ""
     today_str <- format_de_date(Sys.Date())
     tags$div(class = "hub-intro",
-      tags$div(class = "hub-eyebrow", "Zentrallabor – Wartungsplan"),
-      tags$h2(sprintf("Willkommen, %s!", who)),
-      tags$p(paste0("Heute ist ", today_str, ". Hier sehen Sie alle Geräte ",
-                    "auf einen Blick. Klicken Sie auf eine Karte, um die ",
-                    "Tagesaufgaben zu öffnen."))
+             tags$div(class = "hub-eyebrow", "Zentrallabor – Wartungsplan"),
+             tags$h2(sprintf("Willkommen, %s!", who)),
+             tags$p(paste0("Heute ist ", today_str, ". Hier sehen Sie alle Geräte ",
+                           "auf einen Blick. Klicken Sie auf eine Karte, um die ",
+                           "Tagesaufgaben zu öffnen."))
     )
   })
-
+  
   output$hub_summary <- renderUI({
     req(rv$authed)
+    rv$tasks_refresh  # reactive dependency: refresh live when any task is toggled
     devs <- tryCatch(compute_due_today(), error = function(e) NULL)
     if (is.null(devs) || !nrow(devs)) return(NULL)
     n_total   <- nrow(devs)
@@ -4143,72 +4833,84 @@ output$hub_intro <- renderUI({
     n_done    <- n_total - n_open
     sum_open  <- sum(devs$open_count)
     tags$div(class = "hub-summary",
-      tags$div(class = "sum-card",
-        tags$div(class = "sum-icon", icon("microchip")),
-        tags$div(
-          tags$div(class = "sum-num", n_total),
-          tags$div(class = "sum-lbl", "Geräte gesamt")
-        )
-      ),
-      tags$div(class = paste("sum-card clickable", if (sum_open > 0) "warn" else "ok"),
-        title = "Klicken, um die offenen Aufgaben pro Ger\u00e4t anzuzeigen",
-        onclick = "Shiny.setInputValue('hub_open_due_modal', Math.random(), {priority:'event'});",
-        style = "cursor:pointer;",
-        tags$div(class = "sum-icon",
-                 icon(if (sum_open > 0) "triangle-exclamation" else "check")),
-        tags$div(
-          tags$div(class = "sum-num", sum_open),
-          tags$div(class = "sum-lbl", "Offene Aufgaben heute")
-        )
-      ),
-      tags$div(class = "sum-card ok",
-        tags$div(class = "sum-icon", icon("circle-check")),
-        tags$div(
-          tags$div(class = "sum-num", n_done),
-          tags$div(class = "sum-lbl", "Geräte erledigt")
-        )
-      )
+             tags$div(class = "sum-card",
+                      tags$div(class = "sum-icon", icon("microchip")),
+                      tags$div(
+                        tags$div(class = "sum-num", n_total),
+                        tags$div(class = "sum-lbl", "Geräte gesamt")
+                      )
+             ),
+             tags$div(class = paste("sum-card clickable", if (sum_open > 0) "warn" else "ok"),
+                      title = "Klicken, um die offenen Aufgaben pro Ger\u00e4t anzuzeigen",
+                      onclick = "Shiny.setInputValue('hub_open_due_modal', Math.random(), {priority:'event'});",
+                      style = "cursor:pointer;",
+                      tags$div(class = "sum-icon",
+                               icon(if (sum_open > 0) "triangle-exclamation" else "check")),
+                      tags$div(
+                        tags$div(class = "sum-num", sum_open),
+                        tags$div(class = "sum-lbl", "Offene Aufgaben heute")
+                      )
+             ),
+             tags$div(class = "sum-card ok",
+                      tags$div(class = "sum-icon", icon("circle-check")),
+                      tags$div(
+                        tags$div(class = "sum-num", n_done),
+                        tags$div(class = "sum-lbl", "Geräte erledigt")
+                      )
+             )
     )
   })
-
+  
   output$hub_buttons <- renderUI({
     req(rv$authed)
+    rv$tasks_refresh  # reactive dependency: refresh live when any task is toggled
     con <- pg_con(); on.exit(DBI::dbDisconnect(con), add = TRUE)
     devices <- DBI::dbGetQuery(con, "SELECT device_id, label FROM devices ORDER BY device_id")
     
     # ── Arbeitsplatz definitions ──────────────────────────────────────────────
+    # Colours follow the physical lid colours used in the lab, per the
+    # colleague's feedback: Hämatologie rot, Gerinnung grün, Klinische Chemie
+    # orange, Immunologie/Allergologie braun.
     arbeitsplaetze <- list(
       list(
         name    = "Arbeitsplatz 1 \u2013 H\u00e4matologie",
         icon    = "tint",
-        color   = "#B23A48",
-        bg      = "#FFF6F7",
-        border  = "#B23A48",
-        devices = c("g7", "g12", "g13", "g14", "g15")
+        color   = "#c62828",
+        bg      = "#fdecea",
+        border  = "#c62828",
+        devices = c("g7", "g15")
       ),
       list(
         name    = "Arbeitsplatz 2 \u2013 Gerinnung",
         icon    = "wave-square",
-        color   = "#8e24aa",
-        bg      = "#fdf4ff",
-        border  = "#8e24aa",
-        devices = c("g1", "g6", "g11")
+        color   = "#2e7d32",
+        bg      = "#eef7ee",
+        border  = "#2e7d32",
+        devices = c("g1", "g6", "g16", "g11")
       ),
       list(
         name    = "Arbeitsplatz 3 \u2013 Klinische Chemie",
         icon    = "flask",
-        color   = "#1e88e5",
-        bg      = "#f0f7ff",
-        border  = "#1e88e5",
-        devices = c("g3", "g4", "g5", "g9")
+        color   = "#ef6c00",
+        bg      = "#fff4e5",
+        border  = "#ef6c00",
+        devices = c("g4", "g5", "g9")
       ),
       list(
         name    = "Arbeitsplatz 4 \u2013 Immunologie / Allergie",
         icon    = "shield-alt",
-        color   = "#00897b",
-        bg      = "#f0faf9",
-        border  = "#00897b",
+        color   = "#6d4c41",
+        bg      = "#f5efec",
+        border  = "#6d4c41",
         devices = c("g2", "g8", "g10")
+      ),
+      list(
+        name    = "Arbeitsplatz 5 \u2013 Cobas 8100",
+        icon    = "vial",
+        color   = "#ff9800",
+        bg      = "#fff3e0",
+        border  = "#ff9800",
+        devices = c("g3", "g17")
       )
     )
     
@@ -4333,7 +5035,7 @@ output$hub_intro <- renderUI({
   
   
   # observers for each device button
-  lapply(1:15, function(i) {
+  lapply(1:17, function(i) {
     obs_id <- paste0("open_g", i)
     observeEvent(input[[obs_id]], {
       load_device(paste0("g", i))
@@ -4367,8 +5069,8 @@ output$hub_intro <- renderUI({
       return(invisible(NULL))
     }
     task_lookup <- if (!is.null(rv$data) && "Task" %in% names(rv$data))
-                     as.character(rv$data$Task) else character(0)
-
+      as.character(rv$data$Task) else character(0)
+    
     line_items <- lapply(seq_len(nrow(rr)), function(i) {
       ri   <- rr$row_index[i]
       d    <- as.Date(rr$remark_date[i])
@@ -4376,7 +5078,7 @@ output$hub_intro <- renderUI({
       txt  <- rr$remark_text[i] %||% ""
       usr  <- rr$updated_by[i]  %||% ""
       tname <- if (length(task_lookup) >= ri && ri >= 1 && nzchar(task_lookup[ri]))
-                 task_lookup[ri] else paste0("Aufgabe ", ri)
+        task_lookup[ri] else paste0("Aufgabe ", ri)
       key <- sprintf("%d|%s", as.integer(ri), format(d, "%Y-%m-%d"))
       tags$li(
         style = "margin-bottom:10px; padding:10px 12px; border-radius:8px;
@@ -4385,36 +5087,36 @@ output$hub_intro <- renderUI({
         tags$div(
           style = "display:flex; align-items:flex-start; gap:10px; flex-wrap:wrap;",
           tags$div(style = "flex:1 1 240px; min-width:0;",
-            tags$div(style = "font-weight:700; color:#003B73; font-size:13px;",
-                     format(d, "%d.%m.%Y"), " \u2013 \u00BB", tname, "\u00AB"),
-            tags$div(style = "font-size:12px; color:#555; margin-top:3px;",
-              if (nzchar(opt)) tags$span(
-                style = "background:#003B73; color:#fff; padding:1px 6px;
+                   tags$div(style = "font-weight:700; color:#003B73; font-size:13px;",
+                            format(d, "%d.%m.%Y"), " \u2013 \u00BB", tname, "\u00AB"),
+                   tags$div(style = "font-size:12px; color:#555; margin-top:3px;",
+                            if (nzchar(opt)) tags$span(
+                              style = "background:#003B73; color:#fff; padding:1px 6px;
                          border-radius:4px; font-weight:700; margin-right:6px;",
-                opt) else NULL,
-              if (nzchar(txt)) txt else NULL,
-              if (nzchar(usr)) tags$span(style = "opacity:.7; margin-left:6px;",
-                                          paste0("(", usr, ")")) else NULL
-            )
+                              opt) else NULL,
+                            if (nzchar(txt)) txt else NULL,
+                            if (nzchar(usr)) tags$span(style = "opacity:.7; margin-left:6px;",
+                                                       paste0("(", usr, ")")) else NULL
+                   )
           ),
           tags$div(style = "display:flex; gap:6px; flex-shrink:0;",
-            tags$button(
-              type = "button", class = "btn btn-sm btn-default",
-              onclick = sprintf(
-                "Shiny.setInputValue('jump_to_remark', '%s', {priority:'event'});", key),
-              icon("arrow-right"), " Zur Aufgabe"
-            ),
-            tags$button(
-              type = "button", class = "btn btn-sm btn-success",
-              onclick = sprintf(
-                "Shiny.setInputValue('resolve_remark', '%s', {priority:'event'});", key),
-              icon("check"), " Erledigt"
-            )
+                   tags$button(
+                     type = "button", class = "btn btn-sm btn-default",
+                     onclick = sprintf(
+                       "Shiny.setInputValue('jump_to_remark', '%s', {priority:'event'});", key),
+                     icon("arrow-right"), " Zur Aufgabe"
+                   ),
+                   tags$button(
+                     type = "button", class = "btn btn-sm btn-success",
+                     onclick = sprintf(
+                       "Shiny.setInputValue('resolve_remark', '%s', {priority:'event'});", key),
+                     icon("check"), " Erledigt"
+                   )
           )
         )
       )
     })
-
+    
     showModal(modalDialog(
       title = NULL, size = "l", easyClose = TRUE, fade = FALSE,
       footer = tagList(
@@ -4437,7 +5139,7 @@ output$hub_intro <- renderUI({
       tags$ul(style = "margin:0; padding-left:0;", line_items)
     ))
   }
-
+  
   # User clicked "Zur Aufgabe" on a remark – jump to the task in the
   # Tägliche-Aufgaben list.
   observeEvent(input$jump_to_remark, {
@@ -4451,7 +5153,7 @@ output$hub_intro <- renderUI({
     # Switch to the "Tägliche Aufgaben" sub-tab and scroll to the row.
     session$sendCustomMessage("scrollToTaskRow", list(row = ri))
   })
-
+  
   # User clicked "Erledigt" – delete the remark and refresh the modal.
   observeEvent(input$resolve_remark, {
     req(rv$current_device, input$resolve_remark)
@@ -4516,7 +5218,8 @@ output$hub_intro <- renderUI({
     rv$data <- order_cols(df)
     rv$table_status <- status
     rv$task_obs_ids <- character(0)
-
+    rv$prev_task_obs_ids <- character(0)
+    
     # Notify the user if there are recent remarks from previous days for this
     # device (typed reasons or dropdown options like D / sB / etc.). The
     # remarks are shown in a persistent modal so the user can act on each
@@ -4557,7 +5260,7 @@ output$hub_intro <- renderUI({
                  rv$current_device)
       )
     })
-
+    
     # Render the device info area (editable by any authenticated user)
     output$device_info_area <- renderUI({
       req(rv$current_device)
@@ -4571,9 +5274,9 @@ output$hub_intro <- renderUI({
       
       # Load serial numbers for this device
       serials <- load_device_serials(con2, rv$current_device)
-
+      
       is_admin <- identical(rv$role, "admin")
-
+      
       # Build serial number inputs dynamically
       serial_section <- NULL
       if (length(serials) > 0) {
@@ -4589,7 +5292,7 @@ output$hub_intro <- renderUI({
             sn_value <- ""
             label_text <- device_name
           }
-
+          
           inp <- textInput(input_id,
                            label = label_text,
                            value = sn_value,
@@ -4600,7 +5303,7 @@ output$hub_intro <- renderUI({
           }
           tags$div(class = "serial-input-wrapper", inp)
         })
-
+        
         serial_header <- tags$div(
           class = "serial-section-title",
           icon("barcode"),
@@ -4612,7 +5315,7 @@ output$hub_intro <- renderUI({
                       icon("lock"), " Nur Admin")
           }
         )
-
+        
         admin_hint <- if (!is_admin) {
           tags$div(style = "margin-top:8px; font-size:12px; color:#6c757d;
                           background:#f8f9fa; border-left:3px solid #ffc107;
@@ -4620,7 +5323,7 @@ output$hub_intro <- renderUI({
                    icon("info-circle"),
                    " Seriennummern können nur von einem Administrator (Yadwinder, Frank oder Martina) geändert werden.")
         } else NULL
-
+        
         serial_section <- tags$div(
           class = "serial-section",
           serial_header,
@@ -4673,7 +5376,7 @@ output$hub_intro <- renderUI({
         tags$div(
           class = "device-info-container",
           style = "margin-top: 12px;",
-
+          
           # Header
           tags$div(
             class = "device-info-header",
@@ -4687,10 +5390,10 @@ output$hub_intro <- renderUI({
               rv$current_device
             )
           ),
-
+          
           # Device image preview
           image_preview,
-
+          
           # Info text section (kept compact)
           tags$div(
             class = "info-section",
@@ -4702,7 +5405,7 @@ output$hub_intro <- renderUI({
               placeholder = "Zusätzliche Informationen, Hinweise, Besonderheiten..."
             )
           ),
-
+          
           # Action buttons
           tags$div(
             class = "action-buttons",
@@ -4712,10 +5415,10 @@ output$hub_intro <- renderUI({
               class = "btn btn-primary btn-sm"
             )
           ),
-
+          
           # Timestamp
           timestamp,
-
+          
           # Serial numbers - collapsed at the bottom (admin focus)
           if (!is.null(serial_section)) {
             tags$details(
@@ -4735,14 +5438,14 @@ output$hub_intro <- renderUI({
                 }
               ),
               tags$div(style = "margin-top: 12px;",
-                serial_section,
-                tags$div(style = "margin-top: 10px;",
-                  actionButton(
-                    "view_serial_history",
-                    tagList(icon("history"), " Verlauf anzeigen"),
-                    class = "btn btn-default btn-sm"
-                  )
-                )
+                       serial_section,
+                       tags$div(style = "margin-top: 10px;",
+                                actionButton(
+                                  "view_serial_history",
+                                  tagList(icon("history"), " Verlauf anzeigen"),
+                                  class = "btn btn-default btn-sm"
+                                )
+                       )
               )
             )
           }
@@ -4784,7 +5487,7 @@ output$hub_intro <- renderUI({
     
     # Load serial number definitions for this device
     serial_defs <- load_device_serials(con, rv$current_device)
-
+    
     # Save serial numbers if this device has any AND the current user is an admin.
     # Non-admins can update the info text, but Seriennummern bleiben unverändert.
     is_admin <- identical(rv$role, "admin")
@@ -4805,15 +5508,15 @@ output$hub_intro <- renderUI({
       for (device_name in names(serial_defs)) {
         input_id <- paste0("sn_", gsub("[^a-z0-9]", "_", tolower(device_name)))
         new_sn <- as.character(input[[input_id]] %||% "")[1]
-
+        
         # Safely extract definition (may be a list OR a plain string for legacy entries)
         def <- serial_defs[[device_name]]
         if (!is.list(def)) def <- list(label = device_name, sn = as.character(def), pattern = NULL)
-
+        
         # Validate format
         pattern <- def$pattern %||% "^[0-9A-Z]{0,15}$"
         validation <- validate_serial_number(new_sn, pattern, device_name)
-
+        
         if (!validation$valid) {
           validation_errors <- c(validation_errors, validation$message)
         } else {
@@ -4822,7 +5525,7 @@ output$hub_intro <- renderUI({
             sn = new_sn,
             pattern = pattern
           )
-
+          
           # Log change (also safe-extract old serial)
           old_def <- old_serials_data[[device_name]]
           old_sn <- if (is.list(old_def)) (old_def$sn %||% "") else as.character(old_def %||% "")
@@ -4976,7 +5679,8 @@ output$hub_intro <- renderUI({
         oid <- paste0("task_opt_", rr)
         rmid <- paste0("task_rem_", rr)
         nid  <- paste0("task_nicht_", rr)
-        sid  <- paste0("task_save_rem_", rr)
+        dsid <- paste0("task_lastrepl_save_", rr)
+        did  <- paste0("task_lastrepl_", rr)
         
         # when checkbox toggled
         observeEvent(input[[cid]], {
@@ -4992,13 +5696,14 @@ output$hub_intro <- renderUI({
             updateSelectInput(session, oid, selected = "")
             cell_val <- paste0("\u2713 (", who, ")")
             upsert_cell(con, rv$current_device, rr, today, cell_val, who)
-
+            
           } else {
             # delete only if present
             delete_cell_if_owner(con, rv$current_device, rr, today, who, is_admin)
           }
           # Simple update without complex reactive dependencies
           rv$table_status <- load_cell_status_current(con, rv$current_device)
+          rv$tasks_refresh <- isolate(rv$tasks_refresh) + 1L
         }, ignoreInit = TRUE)
         
         # when select input changed -> uncheck checkbox and put abbreviation only
@@ -5017,7 +5722,7 @@ output$hub_intro <- renderUI({
           # Extract abbreviation from full text and put only that in the cell
           abbrev <- sub("^([A-Za-z.øØ]+).*", "\\1", sel)  # Extract the part before the first space/parenthesis
           upsert_cell(con, rv$current_device, rr, today, abbrev, who)
-
+          
           # Persist the option code alongside any current remark text so
           # tomorrow's banner can show "[abbrev] reason".
           cur_text <- isolate(input[[rmid]]) %||% ""
@@ -5026,33 +5731,53 @@ output$hub_intro <- renderUI({
                           cur_text, abbrev, who),
             error = function(e) NULL
           )
-
+          
           # Simple update without complex reactive dependencies
           rv$table_status <- load_cell_status_current(con, rv$current_device)
+          rv$tasks_refresh <- isolate(rv$tasks_refresh) + 1L
         }, ignoreInit = TRUE)
-
-        # when remark text changed -> save (debounced by Shiny's textInput)
-        observeEvent(input[[rmid]], {
+        
+        # Remark field auto-saves ~900ms after the user stops typing, same
+        # as the Erledigt checkbox -- no separate "Speichern" click needed.
+        # This part stays silent (no toast): typing naturally has pauses
+        # longer than 900ms, and a toast on every pause would fire many
+        # times while composing one remark.
+        rem_debounced <- debounce(reactive(input[[rmid]]), 900)
+        rem_save <- function(txt) {
           req(rv$current_device, rv$data)
           who <- rv$user_initials %||% rv$user
-          txt <- input[[rmid]] %||% ""
-          # Pair with the currently selected dropdown option (abbrev), if any.
           sel <- isolate(input[[oid]]) %||% ""
           opt <- if (nzchar(sel)) sub("^([A-Za-z.øØ]+).*", "\\1", sel) else ""
           tryCatch({
             con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
-            upsert_remark(con, rv$current_device, rr, Sys.Date(),
-                          txt, opt, who)
-          }, error = function(e) NULL)
+            upsert_remark(con, rv$current_device, rr, Sys.Date(), txt, opt, who)
+            TRUE
+          }, error = function(e) FALSE)
+        }
+        observeEvent(rem_debounced(), {
+          rem_save(rem_debounced() %||% "")
         }, ignoreInit = TRUE)
-
+        
+        # The confirmation toast fires once, when the user actually leaves
+        # the field (blur) -- not on every debounced save while typing.
+        observeEvent(input[[paste0(rmid, "_blur")]], {
+          ok <- rem_save(isolate(input[[rmid]]) %||% "")
+          if (isTRUE(ok)) {
+            showNotification(
+              "Ihre Eingabe wurde automatisch gespeichert.",
+              id = paste0("save_notif_", rr),
+              type = "message", duration = 60
+            )
+          }
+        }, ignoreInit = TRUE)
+        
         # "Nicht erledigt" button: marks the cell as NE, unchecks Erledigt,
         # and focuses the Bemerkung textbox so the user can type the reason.
         observeEvent(input[[nid]], {
           req(rv$current_device, rv$data)
           updateCheckboxInput(session, cid, value = FALSE)
           updateSelectInput(session, oid,
-            selected = "NE (Nicht erledigt \u2013 bitte Bemerkung eintragen)")
+                            selected = "NE (Nicht erledigt \u2013 bitte Bemerkung eintragen)")
           who <- rv$user_initials %||% rv$user
           today <- as.integer(format(Sys.Date(), "%d"))
           tryCatch({
@@ -5062,43 +5787,204 @@ output$hub_intro <- renderUI({
             upsert_remark(con, rv$current_device, rr, Sys.Date(),
                           cur_text, "NE", who)
             rv$table_status <- load_cell_status_current(con, rv$current_device)
+            rv$tasks_refresh <- isolate(rv$tasks_refresh) + 1L
           }, error = function(e) NULL)
           # focus the textbox via JS
           session$sendCustomMessage("focusTaskRemark", list(id = rmid))
         }, ignoreInit = TRUE)
-
-        # Explicit Save button for the Bemerkung: persists text + current
-        # option and shows a confirmation toast.
-        observeEvent(input[[sid]], {
-          req(rv$current_device, rv$data)
+        
+        # "Zuletzt getauscht am": save the chosen date for this task row.
+        # COBAS Pro I/II electrode rows must always be a Wednesday (shifted
+        # past public holidays); snap and inform the user when needed.
+        observeEvent(input[[dsid]], {
+          req(rv$current_device)
           who <- rv$user_initials %||% rv$user
-          txt <- input[[rmid]] %||% ""
-          sel <- isolate(input[[oid]]) %||% ""
-          opt <- if (nzchar(sel)) sub("^([A-Za-z.øØ]+).*", "\\1", sel) else ""
+          d   <- input[[did]]
+          
+          snapped <- FALSE
+          if (rv$current_device %in% c("g4", "g5") && !is.null(d) && !is.na(d)) {
+            d_in <- suppressWarnings(as.Date(d))
+            d_ok <- snap_to_working_wednesday(d_in)
+            if (!is.na(d_ok) && !identical(d_in, d_ok)) {
+              d <- d_ok
+              snapped <- TRUE
+              # reflect the snapped value in the date picker
+              updateDateInput(session, did, value = d_ok)
+            }
+          }
+          
           ok <- tryCatch({
             con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
-            upsert_remark(con, rv$current_device, rr, Sys.Date(),
-                          txt, opt, who)
+            save_task_meta_date(con, rv$current_device, rr, d, who)
             TRUE
           }, error = function(e) FALSE)
           if (isTRUE(ok)) {
             showNotification(
-              if (nzchar(txt))
-                sprintf("Bemerkung gespeichert: %s", txt)
-              else "Bemerkung gel\u00f6scht.",
-              type = "message", duration = 4
+              if (is.null(d) || is.na(d))
+                "Datum gel\u00f6scht."
+              else if (snapped)
+                sprintf(
+                  "Hinweis: Datum auf den n\u00e4chsten Mittwoch (Werktag) verschoben \u2192 %s",
+                  format(as.Date(d), "%d.%m.%Y"))
+              else sprintf("Datum gespeichert: %s",
+                           format(as.Date(d), "%d.%m.%Y")),
+              type = if (snapped) "warning" else "message",
+              duration = if (snapped) 8 else 4
             )
+            rv$tasks_refresh <- isolate(rv$tasks_refresh) + 1L
           } else {
-            showNotification("Bemerkung konnte nicht gespeichert werden.",
+            showNotification("Datum konnte nicht gespeichert werden.",
                              type = "error", duration = 6)
           }
         }, ignoreInit = TRUE)
-
+        
       })
       rv$task_obs_ids <- unique(c(rv$task_obs_ids, rid))
     }
   }
-
+  
+  # Companion to ensure_task_observers() for the "Vortagsaufgaben" banner.
+  # The inputs use a "prev_" prefix so they are independent from today's
+  # controls, and every write is dated to whatever previous_workday() resolves
+  # to at click time (so we still record the correct day if the user keeps
+  # the session open across midnight). Behavioural parity with today: the
+  # checkbox writes "✓ (user)", the dropdown writes the abbreviation, the
+  # "Nicht erledigt" button writes "NE" and focuses the remark textbox, and
+  # the Save button persists the typed Bemerkung.
+  # Find the schedule header governing row `rr` by scanning rv$data top to
+  # bottom and remembering the last SCHEDULE_HEADER_NAMES header seen.
+  header_for_row <- function(rr) {
+    if (is.null(rv$data) || nrow(rv$data) < rr) return("")
+    hdrs <- as.character(rv$data$Header[seq_len(rr)])
+    hdrs <- hdrs[nzchar(hdrs) & hdrs %in% SCHEDULE_HEADER_NAMES]
+    if (!length(hdrs)) "" else tail(hdrs, 1)
+  }
+  
+  ensure_prev_task_observers <- function(rows) {
+    for (r in rows) {
+      rid <- as.character(r)
+      if (rid %in% rv$prev_task_obs_ids) next
+      local({
+        rr <- r
+        cid  <- paste0("prev_task_done_",     rr)
+        oid  <- paste0("prev_task_opt_",      rr)
+        rmid <- paste0("prev_task_rem_",      rr)
+        nid  <- paste0("prev_task_nicht_",    rr)
+        
+        # Resolve the date this row's task was actually due on -- its
+        # schedule's most recent due date before today, not simply
+        # "yesterday" -- so saving here writes to the correct day even for
+        # weekly/monthly/quarterly tasks that were missed further back.
+        date_parts <- function() {
+          h <- header_for_row(rr)
+          d <- if (nzchar(h)) last_due_on_or_before(h, Sys.Date() - 1L) else NA
+          if (is.na(d)) d <- previous_workday(Sys.Date())
+          list(d = d,
+               day = as.integer(format(d, "%d")),
+               month = as.integer(format(d, "%m")),
+               year = as.integer(format(d, "%Y")))
+        }
+        
+        observeEvent(input[[cid]], {
+          req(rv$current_device, rv$data)
+          val <- isTRUE(input[[cid]])
+          who <- rv$user_initials %||% rv$user
+          is_admin <- identical(rv$role, "admin")
+          dp <- date_parts()
+          con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+          if (val) {
+            updateSelectInput(session, oid, selected = "")
+            cell_val <- paste0("\u2713 (", who, ")")
+            upsert_cell(con, rv$current_device, rr, dp$day, cell_val, who,
+                        month = dp$month, year = dp$year)
+          } else {
+            delete_cell_if_owner(con, rv$current_device, rr, dp$day, who,
+                                 is_admin, month = dp$month, year = dp$year)
+          }
+          rv$table_status <- load_cell_status_current(con, rv$current_device)
+          rv$tasks_refresh <- isolate(rv$tasks_refresh) + 1L
+        }, ignoreInit = TRUE)
+        
+        observeEvent(input[[oid]], {
+          req(rv$current_device, rv$data)
+          sel <- input[[oid]]
+          if (is.null(sel) || sel == "") return()
+          updateCheckboxInput(session, cid, value = FALSE)
+          who <- rv$user_initials %||% rv$user
+          dp <- date_parts()
+          abbrev <- sub("^([A-Za-z.øØ]+).*", "\\1", sel)
+          con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+          upsert_cell(con, rv$current_device, rr, dp$day, abbrev, who,
+                      month = dp$month, year = dp$year)
+          cur_text <- isolate(input[[rmid]]) %||% ""
+          tryCatch(
+            upsert_remark(con, rv$current_device, rr, dp$d,
+                          cur_text, abbrev, who),
+            error = function(e) NULL
+          )
+          rv$table_status <- load_cell_status_current(con, rv$current_device)
+          rv$tasks_refresh <- isolate(rv$tasks_refresh) + 1L
+        }, ignoreInit = TRUE)
+        
+        # Remark field auto-saves ~900ms after the user stops typing, same
+        # as the Erledigt checkbox -- no separate "Speichern" click needed.
+        # This part stays silent (no toast): typing naturally has pauses
+        # longer than 900ms, and a toast on every pause would fire many
+        # times while composing one remark.
+        rem_debounced_b <- debounce(reactive(input[[rmid]]), 900)
+        rem_save_b <- function(txt) {
+          req(rv$current_device, rv$data)
+          who <- rv$user_initials %||% rv$user
+          sel <- isolate(input[[oid]]) %||% ""
+          opt <- if (nzchar(sel)) sub("^([A-Za-z.øØ]+).*", "\\1", sel) else ""
+          dp <- date_parts()
+          tryCatch({
+            con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+            upsert_remark(con, rv$current_device, rr, dp$d, txt, opt, who)
+            TRUE
+          }, error = function(e) FALSE)
+        }
+        observeEvent(rem_debounced_b(), {
+          rem_save_b(rem_debounced_b() %||% "")
+        }, ignoreInit = TRUE)
+        
+        # The confirmation toast fires once, when the user actually leaves
+        # the field (blur) -- not on every debounced save while typing.
+        observeEvent(input[[paste0(rmid, "_blur")]], {
+          ok <- rem_save_b(isolate(input[[rmid]]) %||% "")
+          if (isTRUE(ok)) {
+            showNotification(
+              "Ihre Eingabe wurde automatisch gespeichert.",
+              id = paste0("save_notif_prev_", rr),
+              type = "message", duration = 60
+            )
+          }
+        }, ignoreInit = TRUE)
+        
+        observeEvent(input[[nid]], {
+          req(rv$current_device, rv$data)
+          updateCheckboxInput(session, cid, value = FALSE)
+          updateSelectInput(session, oid,
+                            selected = "NE (Nicht erledigt \u2013 bitte Bemerkung eintragen)")
+          who <- rv$user_initials %||% rv$user
+          dp <- date_parts()
+          tryCatch({
+            con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+            upsert_cell(con, rv$current_device, rr, dp$day, "NE", who,
+                        month = dp$month, year = dp$year)
+            cur_text <- isolate(input[[rmid]]) %||% ""
+            upsert_remark(con, rv$current_device, rr, dp$d,
+                          cur_text, "NE", who)
+            rv$table_status <- load_cell_status_current(con, rv$current_device)
+            rv$tasks_refresh <- isolate(rv$tasks_refresh) + 1L
+          }, error = function(e) NULL)
+          session$sendCustomMessage("focusTaskRemark", list(id = rmid))
+        }, ignoreInit = TRUE)
+      })
+      rv$prev_task_obs_ids <- unique(c(rv$prev_task_obs_ids, rid))
+    }
+  }
+  
   # ---- Monatsübersicht: top-right "open remarks" dropdown ----------------
   # Shows recent / not-yet-closed Bemerkungen grouped into three buckets:
   #   * Tägliche Wartung
@@ -5109,19 +5995,24 @@ output$hub_intro <- renderUI({
   output$monthly_remarks_dropdown <- renderUI({
     req(rv$current_device, rv$data)
     rv$tasks_refresh
-
+    
     # Classify a schedule header into one of three buckets.
     classify_schedule <- function(h) {
       if (is.null(h) || !nzchar(h)) return("other")
-      if (h == "Täglich") return("daily")
-      if (h %in% c("Bei Bedarf", "Start-Up")) return("ondemand")
-      if (h %in% c("Wöchentlich", "Monatlich", "14-tägig", "Quartalsweise",
+      if (h %in% c("Täglich", "Täglich (ZL)", "Täglich (Ablesen zwischen 12:00 und 14:00 Uhr)")) return("daily")
+      if (h %in% c("Bei Bedarf", "Wartung bei Bedarf", "Start-Up")) return("ondemand")
+      if (h %in% c("Wöchentlich", "Wöchentlich (Montag)", "Wöchentlich (Mittwoch)",
+                   "Wöchentlich (Mittwoch, TD)", "Wöchentlich (Donnerstag)",
+                   "Wöchentlich (Freitag)", "Wöchentlich (Freitag, ZL)",
+                   "Monatlich", "Monatlich (Freitag)", "Monatlich oder alle 2500 Proben",
+                   "14-tägig", "Quartalsweise", "Alle 3 Monate oder alle 7500 Proben",
                    "Montag und Donnerstag", "Am ersten Dienstag im Monat",
+                   "Am ersten Freitag im Monat",
                    "Montag", "Dienstag", "Mittwoch", "Donnerstag",
                    "Freitag", "Samstag", "Sonntag")) return("weekmonth")
       "other"
     }
-
+    
     # Build row_index -> schedule header by walking forward through rv$data.
     headers_vec <- as.character(rv$data$Header)
     row_sched <- character(length(headers_vec))
@@ -5133,8 +6024,8 @@ output$hub_intro <- renderUI({
       row_sched[i] <- cur
     }
     task_lookup <- if ("Task" %in% names(rv$data))
-                     as.character(rv$data$Task) else character(length(headers_vec))
-
+      as.character(rv$data$Task) else character(length(headers_vec))
+    
     rr <- tryCatch({
       con_r <- pg_con(); on.exit(dbDisconnect(con_r), add = TRUE)
       load_recent_remarks(con_r, rv$current_device,
@@ -5142,7 +6033,7 @@ output$hub_intro <- renderUI({
                           include_today = TRUE)
     }, error = function(e) data.frame())
     if (is.null(rr)) rr <- data.frame()
-
+    
     buckets <- list(daily = list(), weekmonth = list(), ondemand = list())
     if (nrow(rr)) {
       for (i in seq_len(nrow(rr))) {
@@ -5192,14 +6083,14 @@ output$hub_intro <- renderUI({
         buckets[[cat]] <- append(buckets[[cat]], list(item))
       }
     }
-
+    
     n_total <- length(buckets$daily) + length(buckets$weekmonth) + length(buckets$ondemand)
-
+    
     make_section <- function(title, items) {
       n <- length(items)
       body <- if (n) do.call(tags$ul, items)
-              else tags$div(class = "open-remarks-empty",
-                            "Keine offenen Bemerkungen.")
+      else tags$div(class = "open-remarks-empty",
+                    "Keine offenen Bemerkungen.")
       tags$div(
         class = if (n) "open-remarks-section" else "open-remarks-section collapsed",
         tags$div(class = "sec-head",
@@ -5209,7 +6100,7 @@ output$hub_intro <- renderUI({
         tags$div(class = "sec-body", body)
       )
     }
-
+    
     tags$div(
       class = "open-remarks-wrap",
       tags$button(
@@ -5228,7 +6119,7 @@ output$hub_intro <- renderUI({
       )
     )
   })
-
+  
   output$today_tasks <- renderUI({
     req(rv$current_device, rv$data)
     rv$tasks_refresh
@@ -5242,6 +6133,7 @@ output$hub_intro <- renderUI({
     
     current_date     <- Sys.Date()
     is_first_tuesday <- is_due_28day_cycle(current_date, TUESDAY_CYCLE_ANCHOR)
+    is_first_friday  <- is_due_28day_cycle(current_date, FRIDAY_CYCLE_ANCHOR)
     
     nrows <- nrow(rv$data)
     if (is.null(nrows) || nrows == 0)
@@ -5257,6 +6149,7 @@ output$hub_intro <- renderUI({
     
     today_remarks     <- list()
     recent_remarks_df <- data.frame()
+    task_meta_dates   <- list()
     tryCatch({
       con_r <- pg_con(); on.exit(dbDisconnect(con_r), add = TRUE)
       tr <- load_remarks_for_date(con_r, rv$current_device, Sys.Date())
@@ -5266,16 +6159,166 @@ output$hub_intro <- renderUI({
         list(text = tr$remark_text[i] %||% "", opt = tr$option_code[i] %||% "")
       recent_remarks_df <- load_recent_remarks(con_r, rv$current_device,
                                                today = Sys.Date(), days_back = 14L)
+      task_meta_dates <- load_task_meta_dates(con_r, rv$current_device)
     }, error = function(e) NULL)
     
-    # ── Start ui_list with date header ───────────────────────────────────────
+    # ── Überfällige Aufgaben: any earlier missed due date, not just yesterday ──
+    # For every schedule that is NOT due today, look up its most recent due
+    # date before today (whatever that was -- yesterday for "Täglich", last
+    # Monday for "Wöchentlich", last month for "Monatlich", ...) and surface
+    # any task on it that still has no recorded value_text, so a forgotten
+    # entry stays visible until it's filled in -- no matter how long ago it
+    # became due. "Bei Bedarf" / "Wartung bei Bedarf" have no due date and
+    # are never flagged. Headers due today are handled live in the main list
+    # below and are skipped here to avoid showing them twice.
+    headers_all  <- as.character(rv$data$Header)
+    header_of_row <- character(nrows)
+    {
+      cur_hdr_scan <- ""
+      for (rr_s in seq_len(nrows)) {
+        h_s <- headers_all[rr_s]
+        if (nzchar(h_s)) {
+          if (h_s %in% SCHEDULE_HEADER_NAMES) cur_hdr_scan <- h_s
+          # device sub-headers keep whatever schedule was active above them
+          next
+        }
+        header_of_row[rr_s] <- cur_hdr_scan
+      }
+    }
+    schedule_headers_present <- setdiff(
+      unique(header_of_row[nzchar(header_of_row)]),
+      SCHEDULE_HEADERS_NO_DUE_DATE
+    )
+    due_map <- list()
+    for (h in schedule_headers_present) {
+      if (isTRUE(is_header_due_on(h, Sys.Date()))) next  # shown live today
+      last_due <- last_due_on_or_before(h, Sys.Date() - 1L)
+      if (!is.na(last_due)) due_map[[h]] <- last_due
+    }
+    
+    overdue_missing  <- list()
+    overdue_remarks_map <- list()
+    if (length(due_map)) {
+      my_keys <- unique(vapply(due_map, function(dd) format(dd, "%Y-%m"), character(1)))
+      status_by_my <- list()
+      tryCatch({
+        con_o <- pg_con(); on.exit(dbDisconnect(con_o), add = TRUE)
+        for (k in my_keys) {
+          yy <- as.integer(substr(k, 1, 4)); mm <- as.integer(substr(k, 6, 7))
+          status_by_my[[k]] <- load_cell_status(con_o, rv$current_device, mm, yy)
+        }
+        for (h in names(due_map)) {
+          due_d <- due_map[[h]]
+          pr <- load_remarks_for_date(con_o, rv$current_device, due_d)
+          if (is.data.frame(pr) && nrow(pr))
+            for (i in seq_len(nrow(pr)))
+              overdue_remarks_map[[ paste0(pr$row_index[i], "|", due_d) ]] <-
+            list(text = pr$remark_text[i] %||% "", opt = pr$option_code[i] %||% "")
+        }
+      }, error = function(e) NULL)
+      
+      for (rr_o in seq_len(nrows)) {
+        h_o <- header_of_row[rr_o]
+        if (!nzchar(h_o) || is.null(due_map[[h_o]])) next
+        task_o <- if ("Task" %in% names(rv$data)) as.character(rv$data$Task[rr_o]) else ""
+        if (!nzchar(task_o)) next
+        due_d <- due_map[[h_o]]
+        k     <- format(due_d, "%Y-%m")
+        cs_o  <- status_by_my[[k]]
+        val_o <- ""
+        if (is.data.frame(cs_o) && nrow(cs_o)) {
+          sub_o <- cs_o[cs_o$day == as.integer(format(due_d, "%d")) &
+                          cs_o$row_index == rr_o, , drop = FALSE]
+          if (nrow(sub_o)) val_o <- sub_o$value_text[1]
+        }
+        if (nzchar(val_o)) next
+        overdue_missing[[length(overdue_missing) + 1L]] <- list(
+          row = rr_o, header = h_o, task = task_o, due = due_d
+        )
+      }
+    }
+    
+    # ── Start ui_list with date header (compact, to leave more room for
+    # the task list below) ───────────────────────────────────────────────
     ui_list <- list(
       tags$div(
         class = "date-header",
-        style = "background: linear-gradient(135deg, #003B73 0%, #136377 100%);",
+        style = "background: linear-gradient(135deg, #003B73 0%, #136377 100%);
+                 padding:6px 12px; margin-bottom:10px; font-size:13px;",
         icon("calendar-check"), " ", format_de_date(Sys.Date())
       )
     )
+    
+    # ── Überfällige Aufgaben banner (only when there are missing entries) ───
+    if (length(overdue_missing)) {
+      ensure_prev_task_observers(
+        vapply(overdue_missing, function(x) as.integer(x$row), integer(1))
+      )
+      build_prev_row <- function(item) {
+        rr_b <- item$row
+        task_name_b <- if (nzchar(item$task)) item$task else paste0("Aufgabe ", rr_b)
+        done_id <- paste0("prev_task_done_",     rr_b)
+        opt_id  <- paste0("prev_task_opt_",      rr_b)
+        rem_id  <- paste0("prev_task_rem_",      rr_b)
+        nid_b   <- paste0("prev_task_nicht_",    rr_b)
+        rem_val_b <- overdue_remarks_map[[ paste0(rr_b, "|", item$due) ]]$text %||% ""
+        tags$div(
+          class = "task-item",
+          style = "border-left-color:#f57c00 !important; background:#fff8f0;",
+          tags$div(class = "task-name",
+                   icon("clipboard"), " ",
+                   tags$span(style = "display:inline-block; padding:1px 6px;
+                                       margin-right:6px; border-radius:4px;
+                                       background:#ffd699; color:#7f4f00;
+                                       font-size:10px; font-weight:700;
+                                       text-transform:uppercase; letter-spacing:0.5px;",
+                             item$header),
+                   tags$span(style = "display:inline-block; padding:1px 6px;
+                                       margin-right:6px; border-radius:4px;
+                                       background:#ffe0b2; color:#7f4f00;
+                                       font-size:10px; font-weight:700;",
+                             icon("calendar-xmark"), " ", format_de_short(item$due)),
+                   task_name_b),
+          tags$div(class = "task-controls",
+                   tags$div(class = "task-checkbox",
+                            checkboxInput(done_id, label = "Erledigt", value = FALSE)),
+                   tags$div(class = "task-nicht",
+                            actionButton(nid_b,
+                                         label = tagList(icon("xmark"), " Nicht erledigt"),
+                                         class = "btn btn-sm btn-nicht-erledigt")),
+                   tags$div(class = "task-select",
+                            selectInput(opt_id, label = NULL,
+                                        choices  = c("Andere Option w\u00e4hlen..." = "", TASK_OPTIONS),
+                                        selected = "",
+                                        selectize = FALSE)),
+                   tags$div(class = "task-remark",
+                            textInput(rem_id, label = NULL, value = rem_val_b,
+                                      placeholder = "ggf. Bemerkung eingeben..."))
+          )
+        )
+      }
+      prev_banner_block <- tags$div(
+        style = "margin-bottom:16px;",
+        tags$div(
+          class = "date-header",
+          style = "background: linear-gradient(135deg, #b26500 0%, #f57c00 100%);",
+          icon("triangle-exclamation"),
+          sprintf(" \u00dcberf\u00e4llige Aufgaben (offen: %d)", length(overdue_missing))
+        ),
+        tags$div(
+          style = "padding:10px; background:#fff8f0;
+                   border:1px solid #ffd699;
+                   border-top:none;
+                   border-radius:0 0 8px 8px;",
+          tags$div(style = "font-size:12px; color:#7f4f00; margin-bottom:8px;",
+                   icon("info-circle"),
+                   " Diese Aufgaben waren bereits f\u00e4llig und wurden noch nicht ",
+                   "eingetragen \u2013 bitte nachtragen."),
+          do.call(tagList, lapply(overdue_missing, build_prev_row))
+        )
+      )
+      ui_list <- c(list(prev_banner_block), ui_list)
+    }
     
     # ── "Due right now" red banner ────────────────────────────────────────────
     due_now_tasks <- character(0)
@@ -5306,7 +6349,93 @@ output$hub_intro <- renderUI({
     }
     # ─────────────────────────────────────────────────────────────────────────
     
+    # ── Elektrodenaustausch reminder banner (COBAS Pro I/II) ─────────────────
+    # Surface "zuletzt getauscht am:" rows whose next due Wednesday is today
+    # or already in the past, so the team sees a red call-out at the very top
+    # of the daily list listing exactly what has to be replaced.
+    if (rv$current_device %in% c("g4", "g5")) {
+      replace_due <- list()
+      for (r3 in seq_len(nrows)) {
+        if (nzchar(rv$data$Header[r3])) next
+        tt3 <- if ("Task" %in% names(rv$data)) as.character(rv$data$Task[r3]) else ""
+        if (!nzchar(tt3) || !is_last_replaced_task(tt3)) next
+        months <- extract_replacement_months(tt3)
+        if (is.na(months) || months <= 0L) next
+        last_d <- task_meta_dates[[ as.character(r3) ]]
+        if (is.null(last_d) || is.na(last_d)) {
+          replace_due[[length(replace_due) + 1L]] <- list(
+            row = r3, task = tt3, due = NA, missing = TRUE
+          )
+          next
+        }
+        due_d <- replacement_next_due(last_d, months)
+        if (is.na(due_d)) next
+        if (Sys.Date() >= due_d) {
+          replace_due[[length(replace_due) + 1L]] <- list(
+            row = r3, task = tt3, due = due_d, missing = FALSE,
+            last = as.Date(last_d), months = months
+          )
+        }
+      }
+      if (length(replace_due)) {
+        line_for <- function(item) {
+          short <- sub("\\s*\u2013\\s*zuletzt.*$", "", item$task)
+          if (isTRUE(item$missing)) {
+            txt <- sprintf("%s \u2013 Datum bisher nicht eingetragen.", short)
+          } else {
+            overdue_days <- as.integer(Sys.Date() - item$due)
+            tag <- if (overdue_days <= 0L) "heute f\u00e4llig"
+            else sprintf("\u00fcberf\u00e4llig seit %d Tag%s",
+                         overdue_days, ifelse(overdue_days == 1L, "", "en"))
+            txt <- sprintf("%s \u2013 %s am %s (zuletzt: %s)",
+                           short, tag,
+                           format_de_short(item$due),
+                           format(item$last, "%d.%m.%Y"))
+          }
+          tags$li(
+            tags$a(href = sprintf("#task_row_%d", item$row),
+                   onclick = sprintf(
+                     "var el=document.getElementById('task_row_%d');
+                      if(el){el.scrollIntoView({behavior:'smooth',block:'center'});
+                             el.style.outline='2px solid #fff';
+                             setTimeout(function(){el.style.outline='';},2000);}
+                      return false;", item$row),
+                   style = "color:#fff; text-decoration:underline;",
+                   txt)
+          )
+        }
+        ui_list <- append(ui_list, list(
+          tags$div(
+            style = "background:#d32f2f; color:#fff; border-radius:8px;
+                     padding:12px 16px; margin-bottom:12px;
+                     box-shadow:0 3px 8px rgba(211,47,47,0.3);",
+            tags$div(style = "font-weight:800; font-size:14px; margin-bottom:6px;",
+                     icon("triangle-exclamation"),
+                     " Elektrodenaustausch f\u00e4llig (immer mittwochs)"),
+            tags$div(style = "font-size:12px; opacity:0.92; margin-bottom:6px;",
+                     "Bitte am n\u00e4chsten Mittwoch durchf\u00fchren \u2013 ",
+                     "bei Feiertag am n\u00e4chsten Werktag."),
+            tags$ul(style = "margin:0; padding-left:20px; font-size:13px;",
+                    lapply(replace_due, line_for))
+          )
+        ), after = 1L)
+      }
+    }
+    # ─────────────────────────────────────────────────────────────────────────
+    
     # ── Main loop ─────────────────────────────────────────────────────────────
+    # Sections whose schedule is not due today are hidden completely here
+    # (rather than just dimmed) -- any task from them that's still
+    # unfinished from an earlier due date is already surfaced in the
+    # "Überfällige Aufgaben" banner above, so nothing is silently lost.
+    skip_section <- FALSE
+    # Buffer for a click-to-expand section (currently only Cobas 8100's
+    # "Bei Bedarf"): while active, the header and its task rows are held
+    # here instead of ui_list, then flushed together as one <details>
+    # element so the tasks stay hidden until the user clicks the header.
+    collapse_active     <- FALSE
+    collapse_header_tag <- NULL
+    collapse_buffer     <- list()
     for (r in seq_len(nrows)) {
       hdr       <- as.character(rv$data$Header[r])
       task_text <- if ("Task" %in% names(rv$data)) as.character(rv$data$Task[r]) else ""
@@ -5328,10 +6457,16 @@ output$hub_intro <- renderUI({
         sched_styles <- list(
           "Täglich"                         = list("#28a745","#20c997","#218838", TRUE),
           "Täglich (ZL)"                    = list("#28a745","#20c997","#218838", TRUE),
+          "Täglich (Ablesen zwischen 12:00 und 14:00 Uhr)" = list("#28a745","#20c997","#218838", TRUE),
           "Montag und Donnerstag"           = list("#1e88e5","#42a5f5","#1565c0",
                                                    is_today_monday || is_today_thursday),
           "Wöchentlich"                     = list("#0097a7","#26c6da","#006064", is_today_monday),
           "Wöchentlich (Montag)"            = list("#0097a7","#26c6da","#006064", is_today_monday),
+          "Wöchentlich (Mittwoch)"          = list("#0097a7","#26c6da","#006064",
+                                                   today_day_german == "Mittwoch"),
+          "Wöchentlich (Mittwoch, TD)"      = list("#0097a7","#26c6da","#006064",
+                                                   today_day_german == "Mittwoch"),
+          "Wöchentlich (Donnerstag)"        = list("#0097a7","#26c6da","#006064", is_today_thursday),
           "Wöchentlich (Freitag)"           = list("#0097a7","#26c6da","#006064",
                                                    today_day_german == "Freitag"),
           "14-tägig"                        = list("#5e35b1","#7e57c2","#311b92", is_today_biwk_mon),
@@ -5342,6 +6477,7 @@ output$hub_intro <- renderUI({
           "Quartalsweise"                   = list("#ad1457","#ec407a","#880e4f", is_today_quarter1),
           "Alle 3 Monate oder alle 7500 Proben" = list("#ad1457","#ec407a","#880e4f", is_today_quarter1),
           "Am ersten Dienstag im Monat"     = list("#7f0000","#b71c1c","#4a0000", is_first_tuesday),
+          "Am ersten Freitag im Monat"      = list("#00695c","#26a69a","#004d40", is_first_friday),
           "Bei Bedarf"                      = list("#546e7a","#78909c","#37474f", FALSE),
           "Wartung bei Bedarf"              = list("#546e7a","#78909c","#37474f", FALSE),
           "Nach jeder Migration:"           = list("#546e7a","#78909c","#37474f", TRUE)
@@ -5351,6 +6487,14 @@ output$hub_intro <- renderUI({
         
         sty              <- sched_styles[[hdr]]
         is_today_relevant <- !is.null(sty) && isTRUE(sty[[4]])
+        
+        # Headers with no schedule entry (device sub-grouping labels, e.g.
+        # "PFA (SN 00398)") and "as needed" schedules always show; every
+        # other schedule header is hidden today unless it's actually due.
+        always_show_header <- is.null(sty) || hdr %in% SCHEDULE_HEADERS_NO_DUE_DATE
+        skip_section <- !always_show_header && !is_today_relevant
+        if (skip_section) next
+        
         header_style     <- ""
         if (!is.null(sty))
           header_style <- sprintf(
@@ -5362,49 +6506,73 @@ output$hub_intro <- renderUI({
             sty[[1]], sty[[2]], sty[[3]],
             if (is_today_relevant) "" else " opacity:0.55;"
           )
-
+        
         # Compute the next due date for this schedule (if any).
         next_due_date <- switch(hdr,
-          "Monatlich"                       = next_28day_due(Sys.Date(), MONTHLY_CYCLE_ANCHOR),
-          "Monatlich oder alle 2500 Proben" = next_28day_due(Sys.Date(), MONTHLY_CYCLE_ANCHOR),
-          "Am ersten Dienstag im Monat"     = next_28day_due(Sys.Date(), TUESDAY_CYCLE_ANCHOR),
-          "Wöchentlich"                     = next_monday(Sys.Date()),
-          "Wöchentlich (Montag)"            = next_monday(Sys.Date()),
-          NA
+                                "Monatlich"                       = next_28day_due(Sys.Date(), MONTHLY_CYCLE_ANCHOR),
+                                "Monatlich oder alle 2500 Proben" = next_28day_due(Sys.Date(), MONTHLY_CYCLE_ANCHOR),
+                                "Am ersten Dienstag im Monat"     = next_28day_due(Sys.Date(), TUESDAY_CYCLE_ANCHOR),
+                                "Am ersten Freitag im Monat"      = next_28day_due(Sys.Date(), FRIDAY_CYCLE_ANCHOR),
+                                "Wöchentlich"                     = next_monday(Sys.Date()),
+                                "Wöchentlich (Montag)"            = next_monday(Sys.Date()),
+                                "Wöchentlich (Mittwoch)"          = next_wednesday(Sys.Date()),
+                                "Wöchentlich (Mittwoch, TD)"      = next_wednesday(Sys.Date()),
+                                "Wöchentlich (Donnerstag)"        = next_thursday(Sys.Date()),
+                                NA
         )
         next_due_label <- if (!is.na(next_due_date) && inherits(next_due_date, "Date"))
           sprintf("(f\u00e4llig am %s)", format_de_short(next_due_date))
         else NULL
         
-        ui_list <- append(ui_list, list(
-          if (nzchar(header_style)) {
-            tags$div(class = "task-header", style = header_style,
-                     icon(if (is_today_relevant) "bell" else "calendar"),
-                     " ", hdr,
-                     if (is_today_relevant)
-                       tags$span(style = "margin-left:8px; font-size:11px; opacity:0.9;",
-                                 "(heute fällig)")
-                     else if (!is.null(next_due_label))
-                       tags$span(style = "margin-left:8px; font-size:11px;
-                                          background:rgba(255,255,255,0.22);
-                                          padding:2px 8px; border-radius:999px;
-                                          font-weight:600;",
-                                 next_due_label))
-          } else if (is_device_header) {
-            tags$div(class = "task-header device-header", icon("microchip"), " ", hdr)
-          } else {
-            tags$div(class = "task-header", icon("cog"), " ", hdr)
-          }
-        ))
+        header_tag <- if (nzchar(header_style)) {
+          tags$div(class = "task-header", style = header_style,
+                   icon(if (is_today_relevant) "bell" else "calendar"),
+                   " ", hdr,
+                   if (is_today_relevant)
+                     tags$span(style = "margin-left:8px; font-size:11px; opacity:0.9;",
+                               "(heute fällig)")
+                   else if (!is.null(next_due_label))
+                     tags$span(style = "margin-left:8px; font-size:11px;
+                                        background:rgba(255,255,255,0.22);
+                                        padding:2px 8px; border-radius:999px;
+                                        font-weight:600;",
+                               next_due_label))
+        } else if (is_device_header) {
+          tags$div(class = "task-header device-header", icon("microchip"), " ", hdr)
+        } else {
+          tags$div(class = "task-header", icon("cog"), " ", hdr)
+        }
+        
+        # Flush any still-open collapsible section before starting a new header.
+        if (collapse_active) {
+          ui_list <- append(ui_list, list(
+            tags$details(class = "task-collapse",
+                         tags$summary(collapse_header_tag),
+                         collapse_buffer)
+          ))
+          collapse_active     <- FALSE
+          collapse_header_tag <- NULL
+          collapse_buffer     <- list()
+        }
+        
+        # Cobas 8100's "Bei Bedarf" tasks are rarely needed day-to-day, so
+        # they're tucked behind a click-to-expand section instead of
+        # always taking up space in the list.
+        if (identical(rv$current_device, "g3") && identical(hdr, "Bei Bedarf")) {
+          collapse_active     <- TRUE
+          collapse_header_tag <- header_tag
+        } else {
+          ui_list <- append(ui_list, list(header_tag))
+        }
         
       } else {
         # ── TASK ROW ─────────────────────────────────────────────────────────
+        if (skip_section) next
         task_name <- if (nzchar(task_text)) task_text else paste0("Aufgabe ", r)
         done_id   <- paste0("task_done_",    r)
         opt_id    <- paste0("task_opt_",     r)
         rem_id    <- paste0("task_rem_",     r)
         nicht_id  <- paste0("task_nicht_",   r)
-        save_id   <- paste0("task_save_rem_",r)
         
         existing_val <- existing_for_today[[ as.character(r) ]] %||% ""
         is_done      <- FALSE
@@ -5455,7 +6623,7 @@ output$hub_intro <- renderUI({
           id = paste0("task_row_", r),
           style = item_style,
           tags$div(class = "task-name",
-                   icon(if (is_done) "check-circle" else "circle"),
+                   icon(if (is_done) "clipboard-check" else "clipboard"),
                    " ", task_name, time_badge),
           tags$div(class = "task-controls",
                    tags$div(class = "task-checkbox",
@@ -5471,16 +6639,88 @@ output$hub_intro <- renderUI({
                                         selectize = FALSE)),
                    tags$div(class = remark_class,
                             textInput(rem_id, label = NULL, value = rem_val,
-                                      placeholder = "ggf. Bemerkung eingeben..."),
-                            actionButton(save_id,
-                                         label = tagList(icon("floppy-disk"), " Speichern"),
-                                         class = "btn btn-sm btn-save-remark"))
-          )
+                                      placeholder = "ggf. Bemerkung eingeben..."))
+          ),
+          if (is_last_replaced_task(task_name)) {
+            date_id  <- paste0("task_lastrepl_",      r)
+            date_btn <- paste0("task_lastrepl_save_", r)
+            cur_date <- task_meta_dates[[ as.character(r) ]]
+            if (is.null(cur_date) || is.na(cur_date)) cur_date <- NA
+            # For COBAS Pro I/II compute the next-due Wednesday so the user
+            # can see when the next replacement should happen.
+            next_due  <- NA
+            due_label <- NULL
+            if (rv$current_device %in% c("g4", "g5") &&
+                !is.null(cur_date) && !is.na(cur_date)) {
+              months <- extract_replacement_months(task_name)
+              next_due <- replacement_next_due(cur_date, months)
+              if (!is.na(next_due)) {
+                overdue_n <- as.integer(Sys.Date() - next_due)
+                badge_bg  <- if (overdue_n < 0L) "#e3f2fd"
+                else if (overdue_n == 0L) "#fff3cd"
+                else "#fdecea"
+                badge_fg  <- if (overdue_n < 0L) "#0d47a1"
+                else if (overdue_n == 0L) "#7a5d00"
+                else "#a02218"
+                txt <- if (overdue_n < 0L)
+                  sprintf("N\u00e4chster Austausch: %s",
+                          format_de_short(next_due))
+                else if (overdue_n == 0L)
+                  sprintf("Heute f\u00e4llig (%s)",
+                          format_de_short(next_due))
+                else
+                  sprintf("\u00dcberf\u00e4llig seit %d Tag%s (%s)",
+                          overdue_n,
+                          ifelse(overdue_n == 1L, "", "en"),
+                          format_de_short(next_due))
+                due_label <- tags$span(
+                  style = sprintf(
+                    "background:%s; color:%s; padding:2px 8px; border-radius:999px;
+                     font-size:12px; font-weight:700; margin-left:8px;",
+                    badge_bg, badge_fg),
+                  icon("calendar-week"), " ", txt
+                )
+              }
+            }
+            tags$div(class = "task-lastreplaced",
+                     style = "display:flex; align-items:center; gap:8px; margin-top:6px;
+                       padding:8px 10px; background:#f5faff; border-left:3px solid #1e88e5;
+                       border-radius:6px; font-size:13px; flex-wrap:wrap;",
+                     tags$span(style = "font-weight:600; color:#1e3a5c;",
+                               icon("calendar-day"), " Zuletzt getauscht am:"),
+                     dateInput(date_id, label = NULL,
+                               value = if (is.na(cur_date)) NA else cur_date,
+                               format = "dd.mm.yyyy", language = "de",
+                               weekstart = 1, autoclose = TRUE),
+                     actionButton(date_btn,
+                                  label = tagList(icon("floppy-disk"), " Speichern"),
+                                  class = "btn btn-sm btn-save-remark"),
+                     if (rv$current_device %in% c("g4", "g5"))
+                       tags$span(style = "font-size:11px; color:#1e3a5c; opacity:0.85;
+                                    margin-left:4px;",
+                                 icon("info-circle"),
+                                 " Termin immer mittwochs (bei Feiertag n\u00e4chster Werktag)."),
+                     due_label
+            )
+          }
         )
         
-        ui_list <- append(ui_list, list(row_ui))
+        if (collapse_active) {
+          collapse_buffer <- append(collapse_buffer, list(row_ui))
+        } else {
+          ui_list <- append(ui_list, list(row_ui))
+        }
       }   # end task row
     }     # end for loop
+    
+    # Flush a collapsible section that ran to the end of the table.
+    if (collapse_active) {
+      ui_list <- append(ui_list, list(
+        tags$details(class = "task-collapse",
+                     tags$summary(collapse_header_tag),
+                     collapse_buffer)
+      ))
+    }
     
     do.call(tagList, ui_list)
   })
@@ -5493,16 +6733,14 @@ output$hub_intro <- renderUI({
     rv$tasks_refresh <- isolate(rv$tasks_refresh) + 1L
     showNotification("Aufgaben aktualisiert", type = "message", duration = 2)
   })
-
+  
   # ---- Admin: add a new task to any device ---------------------------------
   # Distinct schedule headers in a device's table (excludes device-section
   # headers which we treat as anything not matching a known schedule).
-  KNOWN_SCHEDULES <- c(
-    "Täglich", "Wöchentlich", "14-tägig", "Monatlich", "Quartalsweise",
-    "Bei Bedarf", "Start-Up",
-    "Montag und Donnerstag", "Am ersten Dienstag im Monat",
-    "Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"
-  )
+  # Reuses SCHEDULE_HEADER_NAMES (defined earlier) as the single source of
+  # truth for recognized schedules, plus "Start-Up" which has no due-date
+  # logic of its own but is still a valid admin-assignable section.
+  KNOWN_SCHEDULES <- c(SCHEDULE_HEADER_NAMES, "Start-Up")
   schedule_headers_for_device <- function(con, device_id) {
     df <- tryCatch(load_device_table(con, device_id), error = function(e) NULL)
     if (is.null(df) || !nrow(df)) return(character(0))
@@ -5528,7 +6766,7 @@ output$hub_intro <- renderUI({
     after  <- if (end_idx < nrow(df)) df[(end_idx + 1L):nrow(df), , drop = FALSE] else df[0, , drop = FALSE]
     rbind(before, new_row, after)
   }
-
+  
   output$admin_add_task_box <- renderUI({
     req(rv$authed)
     if (!identical(rv$role, "admin")) return(NULL)
@@ -5537,6 +6775,7 @@ output$hub_intro <- renderUI({
       DBI::dbGetQuery(con, "SELECT device_id, label FROM devices ORDER BY device_id"),
       error = function(e) data.frame(device_id = character(0), label = character(0))
     )
+    devs <- devs[!(devs$device_id %in% RETIRED_DEVICE_IDS), , drop = FALSE]
     if (!nrow(devs)) {
       return(div(class = "alert alert-warning",
                  "Keine Geräte vorhanden \u2013 neue Aufgabe kann nicht hinzugefügt werden."))
@@ -5546,7 +6785,7 @@ output$hub_intro <- renderUI({
                                    paste0(devs$label, " (", devs$device_id, ")"),
                                    devs$device_id))
     selected_dev <- rv$current_device %||% devs$device_id[1]
-    box(width = 12, collapsible = TRUE, collapsed = TRUE,
+    box(width = 12, collapsible = TRUE, collapsed = FALSE,
         title = "Neue Aufgabe hinzufügen (Admin)",
         status = "warning", solidHeader = TRUE,
         fluidRow(
@@ -5561,7 +6800,7 @@ output$hub_intro <- renderUI({
         helpText("Die Aufgabe wird am Ende des gewählten Wartungsabschnitts eingefügt und sofort gespeichert.")
     )
   })
-
+  
   output$admin_new_task_header_ui <- renderUI({
     req(rv$authed, identical(rv$role, "admin"))
     did <- input$admin_new_task_device %||% rv$current_device
@@ -5576,7 +6815,7 @@ output$hub_intro <- renderUI({
     }
     selectInput("admin_new_task_header", "Wartungsabschnitt", choices = hdrs)
   })
-
+  
   observeEvent(input$admin_add_task_btn, {
     req(rv$authed)
     if (!identical(rv$role, "admin")) {
@@ -5621,13 +6860,406 @@ output$hub_intro <- renderUI({
     })
   })
   
-
-observeEvent(rv$data, {
-  req(rv$data)
-  data_rows <- which(rv$data$Header == "")
-  # ensure_task_observers will create observers for new rows only
-  ensure_task_observers(data_rows)
-}, ignoreNULL = TRUE)
+  
+  # ---- Admin: edit an existing task's text and/or schedule assignment -----
+  # Renumbering row positions is the tricky part here: task_status,
+  # device_cell_status, device_task_remark, and device_task_meta all key
+  # their historical entries by plain positional row_index. Moving a task
+  # into a different schedule section means physically relocating its row,
+  # which shifts the position of every row between the old and new spot --
+  # if we didn't also renumber THEIR history, checkmarks/remarks would end
+  # up silently attached to the wrong task. remap_row_indices() keeps all
+  # four tables in sync whenever a move happens.
+  
+  # Compute the full old-index -> new-index mapping for a move of row
+  # `p_old` (out of `n` original rows) to new position `q` (1-based, in the
+  # table that already had `p_old` removed). Returns a named list, old
+  # index (as character) -> new index; only rows that actually move are
+  # included.
+  compute_move_remap <- function(n, p_old, q) {
+    remap <- list()
+    for (k in seq_len(n)) {
+      if (k == p_old) next
+      m  <- if (k < p_old) k else k - 1L
+      fp <- if (m < q) m else m + 1L
+      if (fp != k) remap[[as.character(k)]] <- fp
+    }
+    remap
+  }
+  
+  # Apply a row_index remap to every history table for one device. Uses a
+  # negative holding range in a first pass so no intermediate UPDATE can
+  # collide with another row's primary key, regardless of the shift pattern.
+  remap_row_indices <- function(con, device_id, remap) {
+    if (!length(remap)) return(invisible(NULL))
+    tables <- c("task_status", "device_cell_status", "device_task_remark", "device_task_meta")
+    OFFSET <- 1000000L
+    DBI::dbWithTransaction(con, {
+      for (tbl in tables) {
+        for (old_idx in as.integer(names(remap))) {
+          DBI::dbExecute(con, sprintf(
+            "UPDATE %s SET row_index = $1 WHERE device_id = $2 AND row_index = $3", tbl),
+            params = list(-(old_idx + OFFSET), device_id, old_idx))
+        }
+        for (old_idx in as.integer(names(remap))) {
+          new_idx <- remap[[as.character(old_idx)]]
+          DBI::dbExecute(con, sprintf(
+            "UPDATE %s SET row_index = $1 WHERE device_id = $2 AND row_index = $3", tbl),
+            params = list(new_idx, device_id, -(old_idx + OFFSET)))
+        }
+      }
+    })
+  }
+  
+  # Move task row `row_idx` (Header == "") so it becomes the last task under
+  # `new_header`'s block. If that schedule doesn't exist yet on this
+  # device, a new header block for it is appended at the end first. Returns
+  # list(df = <new table>, remap = <old->new row_index map, incl. the
+  # moved row itself>) so the caller can keep history tables in sync.
+  move_task_to_header <- function(df, row_idx, new_header) {
+    n <- nrow(df)
+    if (is.null(df) || row_idx < 1 || row_idx > n || nzchar(df$Header[row_idx]))
+      return(list(df = df, remap = list()))
+    row <- df[row_idx, , drop = FALSE]
+    df_without <- df[-row_idx, , drop = FALSE]
+    hdr_idx <- which(df_without$Header == new_header)
+    if (!length(hdr_idx)) {
+      new_hdr_row <- df_without[1, , drop = FALSE]
+      new_hdr_row[1, ] <- ""
+      new_hdr_row$Header <- new_header
+      df_without <- rbind(df_without, new_hdr_row)
+      hdr_idx <- nrow(df_without)
+    }
+    hi <- tail(hdr_idx, 1)
+    later <- which(nzchar(df_without$Header))
+    later <- later[later > hi]
+    end_idx <- if (length(later)) min(later) - 1L else nrow(df_without)
+    q <- end_idx + 1L
+    before <- df_without[seq_len(end_idx), , drop = FALSE]
+    after  <- if (end_idx < nrow(df_without)) df_without[(end_idx + 1L):nrow(df_without), , drop = FALSE] else df_without[0, , drop = FALSE]
+    df_new <- rbind(before, row, after)
+    
+    remap <- compute_move_remap(n, row_idx, q)
+    if (q != row_idx) remap[[as.character(row_idx)]] <- q
+    
+    list(df = df_new, remap = remap)
+  }
+  
+  # ---- Admin diagnostic: inspect raw cell_status/remark history for a device ----
+  # Built to investigate the "wrong initials in Monatsübersicht" report: shows
+  # exactly what's stored (row_index, day, value_text, updated_by, updated_at)
+  # so a mismatch between the task now at that row and who the DB says touched
+  # it becomes visible directly, instead of guessing from code alone.
+  output$admin_diag_box <- renderUI({
+    req(rv$authed)
+    if (!identical(rv$role, "admin")) return(NULL)
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    devs <- tryCatch(
+      DBI::dbGetQuery(con, "SELECT device_id, label FROM devices ORDER BY device_id"),
+      error = function(e) data.frame(device_id = character(0), label = character(0))
+    )
+    devs <- devs[!(devs$device_id %in% RETIRED_DEVICE_IDS), , drop = FALSE]
+    if (!nrow(devs)) return(NULL)
+    dev_choices <- setNames(devs$device_id,
+                            ifelse(nzchar(devs$label %||% ""),
+                                   paste0(devs$label, " (", devs$device_id, ")"),
+                                   devs$device_id))
+    box(width = 12, collapsible = TRUE, collapsed = TRUE,
+        title = "Diagnose: Rohdaten je Aufgabe (Admin)",
+        status = "info", solidHeader = TRUE,
+        fluidRow(
+          column(4, selectInput("admin_diag_device", "Gerät",
+                                choices = dev_choices,
+                                selected = rv$current_device %||% devs$device_id[1])),
+          column(4, numericInput("admin_diag_month", "Monat",
+                                 value = as.integer(format(Sys.Date(), "%m")), min = 1, max = 12)),
+          column(4, numericInput("admin_diag_year", "Jahr",
+                                 value = as.integer(format(Sys.Date(), "%Y")), min = 2020, max = 2100))
+        ),
+        actionButton("admin_diag_run", "Rohdaten anzeigen", icon = icon("magnifying-glass")),
+        tags$div(style = "margin-top:12px;", tableOutput("admin_diag_table")),
+        helpText("Zeigt für jede gespeicherte Zelle: aktuelle Position (Zeile/Aufgabentext), Tag, ",
+                 "gespeicherter Wert, wer ihn laut Datenbank gesetzt hat, und wann. Hilft zu erkennen, ",
+                 "ob eine Zeile durch eine frühere Strukturänderung verschoben wurde.")
+    )
+  })
+  
+  observeEvent(input$admin_diag_run, {
+    req(rv$authed, identical(rv$role, "admin"))
+    did <- input$admin_diag_device
+    mo  <- input$admin_diag_month
+    yr  <- input$admin_diag_year
+    req(did)
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    df <- tryCatch(load_device_table(con, did) %||% create_initial_table(did),
+                   error = function(e) NULL)
+    cs <- tryCatch(load_cell_status(con, did, mo, yr), error = function(e) NULL)
+    if (is.null(df) || is.null(cs) || !nrow(cs)) {
+      output$admin_diag_table <- renderTable({
+        data.frame(Hinweis = "Keine Daten für diese Auswahl gefunden.")
+      })
+      return()
+    }
+    cur_hdr <- character(nrow(df))
+    h <- ""
+    for (i in seq_len(nrow(df))) {
+      if (nzchar(df$Header[i])) h <- df$Header[i]
+      cur_hdr[i] <- h
+    }
+    out <- data.frame(
+      Zeile      = cs$row_index,
+      Abschnitt  = ifelse(cs$row_index >= 1 & cs$row_index <= nrow(df),
+                          cur_hdr[pmax(1, pmin(cs$row_index, nrow(df)))], NA),
+      Aufgabe    = ifelse(cs$row_index >= 1 & cs$row_index <= nrow(df),
+                          df$Task[pmax(1, pmin(cs$row_index, nrow(df)))], NA),
+      Tag        = cs$day,
+      Wert       = cs$value_text,
+      Wer        = cs$updated_by,
+      Zuletzt_am = format(as.POSIXct(cs$updated_at, tz = "Europe/Berlin"), "%Y-%m-%d %H:%M"),
+      stringsAsFactors = FALSE
+    )
+    out <- out[order(out$Zeile, out$Tag), , drop = FALSE]
+    output$admin_diag_table <- renderTable(out)
+  })
+  
+  output$admin_edit_task_box <- renderUI({
+    req(rv$authed)
+    if (!identical(rv$role, "admin")) return(NULL)
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    devs <- tryCatch(
+      DBI::dbGetQuery(con, "SELECT device_id, label FROM devices ORDER BY device_id"),
+      error = function(e) data.frame(device_id = character(0), label = character(0))
+    )
+    devs <- devs[!(devs$device_id %in% RETIRED_DEVICE_IDS), , drop = FALSE]
+    if (!nrow(devs)) return(NULL)
+    dev_choices <- setNames(devs$device_id,
+                            ifelse(nzchar(devs$label %||% ""),
+                                   paste0(devs$label, " (", devs$device_id, ")"),
+                                   devs$device_id))
+    selected_dev <- rv$current_device %||% devs$device_id[1]
+    box(width = 12, collapsible = TRUE, collapsed = FALSE,
+        title = "Aufgabe bearbeiten (Admin)",
+        status = "warning", solidHeader = TRUE,
+        fluidRow(
+          column(4, selectInput("admin_edit_task_device", "Gerät",
+                                choices = dev_choices, selected = selected_dev)),
+          column(8, uiOutput("admin_edit_task_picker_ui"))
+        ),
+        fluidRow(
+          column(6, textInput("admin_edit_task_text", "Aufgabentext")),
+          column(6, uiOutput("admin_edit_task_header_ui"))
+        ),
+        actionButton("admin_edit_task_save_btn", "Änderungen speichern",
+                     class = "btn btn-warning", icon = icon("save")),
+        actionButton("admin_delete_task_btn", "Aufgabe löschen",
+                     class = "btn btn-danger", icon = icon("trash"),
+                     style = "margin-left:8px;"),
+        helpText("Ändert Text und/oder Wartungsabschnitt (Tag/Rhythmus) einer bestehenden Aufgabe. ",
+                 "Wird der Abschnitt geändert, verschiebt sich die Aufgabe im Zeitplan; ihre bisherige ",
+                 "Historie (Haken/Bemerkungen) wandert automatisch mit an die neue Stelle. ",
+                 "Löschen entfernt die Aufgabe und ihre gesamte Historie unwiderruflich.")
+    )
+  })
+  
+  output$admin_edit_task_picker_ui <- renderUI({
+    req(rv$authed, identical(rv$role, "admin"))
+    did <- input$admin_edit_task_device %||% rv$current_device
+    req(did)
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    df <- tryCatch(load_device_table(con, did) %||% create_initial_table(did),
+                   error = function(e) NULL)
+    if (is.null(df) || !nrow(df)) {
+      return(selectInput("admin_edit_task_picker", "Aufgabe", choices = character(0)))
+    }
+    cur_hdr <- ""
+    labels <- character(0)
+    values <- character(0)
+    for (i in seq_len(nrow(df))) {
+      h <- df$Header[i]
+      if (nzchar(h)) { cur_hdr <- h; next }
+      t <- df$Task[i]
+      if (!nzchar(t)) next
+      labels <- c(labels, sprintf("[%s] %s", cur_hdr, t))
+      values <- c(values, as.character(i))
+    }
+    if (!length(values)) {
+      return(tagList(
+        selectInput("admin_edit_task_picker", "Aufgabe", choices = character(0)),
+        helpText("Keine Aufgaben für dieses Gerät gefunden.")
+      ))
+    }
+    selectInput("admin_edit_task_picker", "Aufgabe", choices = setNames(values, labels))
+  })
+  
+  output$admin_edit_task_header_ui <- renderUI({
+    req(rv$authed, identical(rv$role, "admin"))
+    selectInput("admin_edit_task_header", "Wartungsabschnitt (Tag/Rhythmus)",
+                choices = KNOWN_SCHEDULES)
+  })
+  
+  # Pre-fill text + header fields whenever the device or the picked task changes.
+  observeEvent(list(input$admin_edit_task_device, input$admin_edit_task_picker), {
+    did  <- input$admin_edit_task_device
+    ridx <- suppressWarnings(as.integer(input$admin_edit_task_picker))
+    req(did, !is.na(ridx))
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    df <- tryCatch(load_device_table(con, did) %||% create_initial_table(did),
+                   error = function(e) NULL)
+    if (is.null(df) || ridx < 1 || ridx > nrow(df)) return()
+    updateTextInput(session, "admin_edit_task_text", value = df$Task[ridx] %||% "")
+    cur_hdr <- ""
+    for (i in seq_len(ridx)) if (nzchar(df$Header[i])) cur_hdr <- df$Header[i]
+    updateSelectInput(session, "admin_edit_task_header", selected = cur_hdr)
+  }, ignoreInit = TRUE)
+  
+  observeEvent(input$admin_edit_task_save_btn, {
+    req(rv$authed)
+    if (!identical(rv$role, "admin")) {
+      showNotification("Nur Admins können Aufgaben bearbeiten.", type = "error"); return()
+    }
+    did      <- input$admin_edit_task_device
+    ridx     <- suppressWarnings(as.integer(input$admin_edit_task_picker))
+    new_text <- trimws(input$admin_edit_task_text %||% "")
+    new_hdr  <- input$admin_edit_task_header
+    if (is.null(did) || !nzchar(did) || is.na(ridx)) {
+      showNotification("Bitte Gerät und Aufgabe wählen.", type = "error"); return()
+    }
+    if (!nzchar(new_text)) {
+      showNotification("Aufgabentext darf nicht leer sein.", type = "error"); return()
+    }
+    if (is.null(new_hdr) || !nzchar(new_hdr)) {
+      showNotification("Bitte einen Wartungsabschnitt wählen.", type = "error"); return()
+    }
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    df <- tryCatch(load_device_table(con, did) %||% create_initial_table(did),
+                   error = function(e) NULL)
+    if (is.null(df) || ridx < 1 || ridx > nrow(df) || nzchar(df$Header[ridx])) {
+      showNotification("Aufgabe konnte nicht gefunden werden (Tabelle hat sich evtl. geändert).",
+                       type = "error"); return()
+    }
+    old_hdr <- ""
+    for (i in seq_len(ridx)) if (nzchar(df$Header[i])) old_hdr <- df$Header[i]
+    df$Task[ridx] <- new_text
+    
+    if (!identical(old_hdr, new_hdr)) {
+      moved   <- move_task_to_header(df, ridx, new_hdr)
+      df_new  <- moved$df
+      tryCatch({
+        remap_row_indices(con, did, moved$remap)
+        save_device_table(con, did, df_new, rv$user %||% "<admin>")
+        showNotification(sprintf("Aufgabe aktualisiert und nach '%s' verschoben.", new_hdr),
+                         type = "message")
+        if (identical(did, rv$current_device)) {
+          rv$data <- order_cols(df_new)
+          rv$table_status <- load_cell_status_current(con, did)
+          rv$tasks_refresh <- isolate(rv$tasks_refresh) + 1L
+        }
+      }, error = function(e) {
+        showNotification(paste("Fehler beim Speichern:", conditionMessage(e)), type = "error")
+      })
+    } else {
+      tryCatch({
+        save_device_table(con, did, df, rv$user %||% "<admin>")
+        showNotification("Aufgabe aktualisiert.", type = "message")
+        if (identical(did, rv$current_device)) {
+          rv$data <- order_cols(df)
+          rv$table_status <- load_cell_status_current(con, did)
+          rv$tasks_refresh <- isolate(rv$tasks_refresh) + 1L
+        }
+      }, error = function(e) {
+        showNotification(paste("Fehler beim Speichern:", conditionMessage(e)), type = "error")
+      })
+    }
+  })
+  
+  # Remove task row `row_idx` entirely, along with its own history in all
+  # four history tables, and shift every later row's row_index down by one
+  # (via the same safe two-phase remap used for moves) so nothing after it
+  # ends up misattributed to the wrong task.
+  delete_task_row <- function(df, row_idx) {
+    n <- nrow(df)
+    if (row_idx < 1 || row_idx > n || nzchar(df$Header[row_idx]))
+      return(list(df = df, remap = list()))
+    remap <- list()
+    if (row_idx < n) {
+      for (k in (row_idx + 1L):n) remap[[as.character(k)]] <- k - 1L
+    }
+    df_new <- df[-row_idx, , drop = FALSE]
+    list(df = df_new, remap = remap)
+  }
+  
+  delete_task_history <- function(con, device_id, row_idx) {
+    tables <- c("task_status", "device_cell_status", "device_task_remark", "device_task_meta")
+    for (tbl in tables) {
+      DBI::dbExecute(con, sprintf(
+        "DELETE FROM %s WHERE device_id = $1 AND row_index = $2", tbl),
+        params = list(device_id, row_idx))
+    }
+  }
+  
+  # "Aufgabe löschen": ask for confirmation before permanently removing a task.
+  observeEvent(input$admin_delete_task_btn, {
+    req(rv$authed)
+    if (!identical(rv$role, "admin")) {
+      showNotification("Nur Admins können Aufgaben löschen.", type = "error"); return()
+    }
+    ridx <- suppressWarnings(as.integer(input$admin_edit_task_picker))
+    if (is.na(ridx)) {
+      showNotification("Bitte eine Aufgabe wählen.", type = "error"); return()
+    }
+    task_label <- trimws(input$admin_edit_task_text %||% "")
+    showModal(modalDialog(
+      title = "Aufgabe löschen",
+      paste0("Möchten Sie die Aufgabe '", task_label,
+             "' wirklich endgültig löschen? Die gesamte Historie ",
+             "(Haken/Bemerkungen) dieser Aufgabe geht dabei unwiderruflich verloren."),
+      footer = tagList(
+        modalButton("Abbrechen"),
+        actionButton("admin_delete_task_confirm", "Löschen", class = "btn btn-danger")
+      ),
+      easyClose = TRUE
+    ))
+  })
+  
+  observeEvent(input$admin_delete_task_confirm, {
+    req(rv$authed)
+    if (!identical(rv$role, "admin")) { removeModal(); return() }
+    did  <- input$admin_edit_task_device
+    ridx <- suppressWarnings(as.integer(input$admin_edit_task_picker))
+    if (is.null(did) || !nzchar(did) || is.na(ridx)) { removeModal(); return() }
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    df <- tryCatch(load_device_table(con, did) %||% create_initial_table(did),
+                   error = function(e) NULL)
+    if (is.null(df) || ridx < 1 || ridx > nrow(df) || nzchar(df$Header[ridx])) {
+      removeModal()
+      showNotification("Aufgabe konnte nicht gefunden werden (Tabelle hat sich evtl. geändert).",
+                       type = "error"); return()
+    }
+    result <- delete_task_row(df, ridx)
+    tryCatch({
+      delete_task_history(con, did, ridx)
+      remap_row_indices(con, did, result$remap)
+      save_device_table(con, did, result$df, rv$user %||% "<admin>")
+      removeModal()
+      showNotification("Aufgabe gelöscht.", type = "message")
+      if (identical(did, rv$current_device)) {
+        rv$data <- order_cols(result$df)
+        rv$table_status <- load_cell_status_current(con, did)
+        rv$tasks_refresh <- isolate(rv$tasks_refresh) + 1L
+      }
+    }, error = function(e) {
+      removeModal()
+      showNotification(paste("Fehler beim Löschen:", conditionMessage(e)), type = "error")
+    })
+  })
+  
+  
+  observeEvent(rv$data, {
+    req(rv$data)
+    data_rows <- which(rv$data$Header == "")
+    # ensure_task_observers will create observers for new rows only
+    ensure_task_observers(data_rows)
+  }, ignoreNULL = TRUE)
   
   observeEvent(input$mark_today, {
     req(rv$current_device, rv$data)
@@ -5661,14 +7293,14 @@ observeEvent(rv$data, {
     sel_y <- suppressWarnings(as.integer(input$year))
     if (length(sel_m) != 1L || is.na(sel_m)) sel_m <- as.integer(format(Sys.Date(), "%m"))
     if (length(sel_y) != 1L || is.na(sel_y)) sel_y <- as.integer(format(Sys.Date(), "%Y"))
-
+    
     cur_m <- as.integer(format(Sys.Date(), "%m"))
     cur_y <- as.integer(format(Sys.Date(), "%Y"))
     is_current <- (sel_m == cur_m && sel_y == cur_y)
-
+    
     # Refresh invalid-day mask for the selected month/year
     rv$invalid_days <- calc_invalid_days(sel_y, sel_m)
-
+    
     # For the current month use the live rv$table_status; for historical
     # months load a snapshot filtered by month/year so the user sees that
     # month's logs and the comments left by other users.
@@ -5680,13 +7312,13 @@ observeEvent(rv$data, {
         load_cell_status(con, rv$current_device, sel_m, sel_y)
       }, error = function(e) data.frame())
     }
-
+    
     # Remarks (other users' Bemerkungen) for the selected month
     view_remarks <- tryCatch({
       con2 <- pg_con(); on.exit(dbDisconnect(con2), add = TRUE)
       load_remarks_for_month(con2, rv$current_device, sel_m, sel_y)
     }, error = function(e) data.frame())
-
+    
     output$tableRH <- renderRHandsontable({
       cells_readonly_for_headers(
         rv$data, rv$user_initials, view_status,
@@ -5737,13 +7369,40 @@ observeEvent(rv$data, {
         return()
       }
       
-      # Check if template file exists
+      # Check if template file exists (resolve next to app.R so it works
+      # regardless of the runtime working directory)
       template_path <- "wartungsplan_template.Rmd"
       if (!file.exists(template_path)) {
+        alt <- file.path(getwd(), "wartungsplan_template.Rmd")
+        if (file.exists(alt)) {
+          template_path <- alt
+        } else {
+          showNotification(
+            paste0("Template-Datei 'wartungsplan_template.Rmd' nicht gefunden! ",
+                   "Gesucht in: ", normalizePath(".", mustWork = FALSE)),
+            type = "error",
+            duration = 15
+          )
+          return()
+        }
+      }
+      template_path <- normalizePath(template_path, mustWork = TRUE)
+      
+      # Pre-flight: the template requires xelatex specifically. Checking
+      # for it up front turns a missing/broken LaTeX install into a clear
+      # message instead of the generic "cannot open connection" error that
+      # bubbles up from deep inside rmarkdown/pandoc when the engine isn't
+      # found or the compile never produces an output file.
+      xelatex_path <- Sys.which("xelatex")
+      tinytex_ok <- requireNamespace("tinytex", quietly = TRUE) &&
+        tryCatch(isTRUE(tinytex::is_tinytex()), error = function(e) FALSE)
+      if (!nzchar(xelatex_path) && !tinytex_ok) {
         showNotification(
-          "Template-Datei 'wartungsplan_template.Rmd' nicht gefunden!",
-          type = "error",
-          duration = 10
+          paste0("PDF-Erstellung nicht möglich: Auf dem Server ist keine ",
+                 "LaTeX-Installation (xelatex) gefunden. Bitte einen ",
+                 "Administrator bitten, TinyTeX zu installieren ",
+                 "(tinytex::install_tinytex())."),
+          type = "error", duration = 20
         )
         return()
       }
@@ -5760,7 +7419,7 @@ observeEvent(rv$data, {
       sel_year  <- suppressWarnings(as.integer(input$year))
       if (length(sel_month) != 1L || is.na(sel_month)) sel_month <- as.integer(format(Sys.Date(), "%m"))
       if (length(sel_year)  != 1L || is.na(sel_year))  sel_year  <- as.integer(format(Sys.Date(), "%Y"))
-
+      
       pdf_df <- build_overlayed_table(rv$data,
                                       load_cell_status(con, rv$current_device,
                                                        sel_month, sel_year))
@@ -5780,13 +7439,13 @@ observeEvent(rv$data, {
       }, error = function(e) {
         list()
       })
-
+      
       # Get device layout (footer text + version)
       layout <- tryCatch(load_device_layout(con, rv$current_device),
-                        error = function(e) list(footer_text = NULL, version = NULL))
+                         error = function(e) list(footer_text = NULL, version = NULL))
       footer_text <- if (!is.null(layout$footer_text) && nzchar(layout$footer_text)) layout$footer_text else ""
       version_str <- if (!is.null(layout$version) && nzchar(layout$version)) layout$version else ""
-
+      
       month_de  <- unname(.DE_MONTHS[sel_month])
       month_str <- sprintf("%s %d", month_de, sel_year)
       
@@ -5796,6 +7455,11 @@ observeEvent(rv$data, {
           input = template_path,
           output_file = basename(file),
           output_dir = dirname(file),
+          # rmarkdown writes its intermediate/knit files next to `input` by
+          # default; in a deployed app that directory is often read-only,
+          # which surfaces as a generic "cannot open connection" error.
+          # Pointing intermediates at a writable temp dir avoids that.
+          intermediates_dir = tempdir(),
           params = list(
             table_data = pdf_df,
             device_label = device_label,
@@ -5818,6 +7482,13 @@ observeEvent(rv$data, {
         # Remove progress notification
         removeNotification(id = "pdf_generation")
         
+        # Surface the actual render/LaTeX error so it can be diagnosed
+        message("LaTeX PDF generation failed: ", e$message)
+        showNotification(
+          paste0("PDF-Fehler: ", e$message),
+          type = "error", duration = 20
+        )
+        
         # Fallback: Create HTML version
         warning("LaTeX PDF generation failed: ", e$message)
         
@@ -5838,7 +7509,7 @@ observeEvent(rv$data, {
           }
         }
         
-              html_content <- paste0("
+        html_content <- paste0("
       <!DOCTYPE html>
       <html>
       <head>
