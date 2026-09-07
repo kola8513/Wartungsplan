@@ -94,8 +94,8 @@ is_first_workday_of_quarter <- function(d = Sys.Date()) {
 MONTHLY_CYCLE_ANCHOR  <- as.Date("2024-01-01")  # Monday – baseline for Monatlich
 TUESDAY_CYCLE_ANCHOR  <- as.Date("2024-01-02")  # Tuesday – baseline for "Am ersten Dienstag im Monat"
 FRIDAY_CYCLE_ANCHOR   <- as.Date("2024-01-05")  # Friday – baseline for "Am ersten Freitag im Monat"
-PHADIA_FRIDAY_CYCLE_ANCHOR <- as.Date("2025-09-11")  # Drives Phadia's monthly Friday cycle; next due is 11.09.2025
-ANALYZER_TUESDAY_CYCLE_ANCHOR <- as.Date("2025-09-02")  # Last-done reference 01.09.2025; 4-week cycle fires on Tuesdays
+PHADIA_MONTHLY_ANCHOR <- as.Date("2026-09-11")  # Friday – Phadia monthly (4-week cycle)
+ANALYZER_MONTHLY_ANCHOR <- as.Date("2026-09-01")  # Tuesday – Euroimmun Analyzer monthly (4-week cycle)
 
 is_due_28day_cycle <- function(d = Sys.Date(), anchor) {
   d <- as.Date(d); anchor <- as.Date(anchor)
@@ -1028,7 +1028,7 @@ create_initial_table <- function(device_id = NULL) {
     rows <- rbind(rows, mk_row(header = "", task = "Phadia-Prime-PC herunterfahren"))
     
     # ── Monatlich ────────────────────────────────────────────────────────────
-    rows <- rbind(rows, mk_row(header = "Monatlich (Phadia, Freitag)", task = ""))
+    rows <- rbind(rows, mk_row(header = "Monatlich (Freitag, 4-wöchentlich)", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Erweitertes monatl. Spülen mit Maintenace Solution"))
     rows <- rbind(rows, mk_row(header = "", task = "Monatl. Wartung entsprechend Anleitung im PC"))
     rows <- rbind(rows, mk_row(header = "", task = "Wash- u. Rinse-Kanister gründlich reinigen u. trocken"))
@@ -1488,7 +1488,7 @@ und zusätzlich NORMAL/HIGH im wöchentlichen Wechsel"))
     rows <- rbind(rows, mk_row(header = "", task = "Reinigen und desinfizieren der Geräteoberflächen"))
     
     # ── Monatlich ────────────────────────────────────────────────────────────
-    rows <- rbind(rows, mk_row(header = "Monatlich (Analyzer, Dienstag)", task = ""))
+    rows <- rbind(rows, mk_row(header = "Monatlich (Dienstag, 4-wöchentlich)", task = ""))
     rows <- rbind(rows, mk_row(header = "", task = "Vorratsbehälter m. Reinigungslösung füllen + Maintenance monthly ausführen"))
     rows <- rbind(rows, mk_row(header = "", task = "Vorratsbehälter mit A.dest ausspülen und befüllen Rinse monthly"))
     rows <- rbind(rows, mk_row(header = "", task = "Systemflüssigkeitsbehälter desinfizieren, anschließend gründlich mit A.dest spülen + mit A.dest neu befüllen"))
@@ -1719,6 +1719,21 @@ load_device_table <- function(con, device_id) {
       df <- order_cols(df)
       save_device_table(con, device_id, df, "<system>")
     }
+  }
+  
+  # ---- Header text migration: Phadia / Analyzer monthly cycle names ---------
+  needs_header_rename <- FALSE
+  if (identical(device_id, "g10") && any(df$Header == "Monatlich (Phadia, Freitag)")) {
+    df$Header[df$Header == "Monatlich (Phadia, Freitag)"] <- "Monatlich (Freitag, 4-wöchentlich)"
+    needs_header_rename <- TRUE
+  }
+  if (identical(device_id, "g2") && any(df$Header == "Monatlich (Analyzer, Dienstag)")) {
+    df$Header[df$Header == "Monatlich (Analyzer, Dienstag)"] <- "Monatlich (Dienstag, 4-wöchentlich)"
+    needs_header_rename <- TRUE
+  }
+  if (needs_header_rename) {
+    df <- order_cols(df)
+    save_device_table(con, device_id, df, "<system>")
   }
   
   df
@@ -2172,8 +2187,8 @@ cells_readonly_for_headers <- function(df, current_user_initials, cell_status_df
             'Wöchentlich (Freitag, ZL)':     '#0097a7',
             '14-tägig':                      '#5e35b1',
             'Monatlich':                     '#8e24aa',
-            'Monatlich (Phadia, Freitag)':   '#8e24aa',
-            'Monatlich (Analyzer, Dienstag)':'#8e24aa',
+            'Monatlich (Freitag, 4-wöchentlich)': '#8e24aa',
+            'Monatlich (Dienstag, 4-wöchentlich)':'#8e24aa',
             'Monatlich (Freitag)':           '#8e24aa',
             'Monatlich oder alle 2500 Proben': '#8e24aa',
             'Quartalsweise':                 '#ad1457',
@@ -3643,7 +3658,7 @@ body <- dashboardBody(
       ),
       
       tabItem(tabName = "all_tasks",
-               uiOutput("all_tasks_panel")
+              uiOutput("all_tasks_overview")
               ),
       tabItem(tabName = "layout",
               h3("Kopf- / Fußzeile ändern"),
@@ -3774,8 +3789,8 @@ server <- function(input, output, session) {
            "Samstag"                       = (today_wd == "Saturday"),
            "Sonntag"                       = (today_wd == "Sunday"),
            "Monatlich"                     = is_due_28day_cycle(Sys.Date(), MONTHLY_CYCLE_ANCHOR),
-           "Monatlich (Phadia, Freitag)"   = is_due_28day_cycle(Sys.Date(), PHADIA_FRIDAY_CYCLE_ANCHOR),
-           "Monatlich (Analyzer, Dienstag)" = is_due_28day_cycle(Sys.Date(), ANALYZER_TUESDAY_CYCLE_ANCHOR),
+           "Monatlich (Freitag, 4-wöchentlich)" = is_due_28day_cycle(Sys.Date(), PHADIA_MONTHLY_ANCHOR),
+           "Monatlich (Dienstag, 4-wöchentlich)" = is_due_28day_cycle(Sys.Date(), ANALYZER_MONTHLY_ANCHOR),
            
            "Monatlich (Freitag)"           = (today_wd == "Friday" && is_first_workday_of_month()),
            "Monatlich oder alle 2500 Proben" = is_due_28day_cycle(Sys.Date(), MONTHLY_CYCLE_ANCHOR),
@@ -3822,8 +3837,8 @@ server <- function(input, output, session) {
            "Samstag"                       = (wd_en == "Saturday"),
            "Sonntag"                       = (wd_en == "Sunday"),
            "Monatlich"                     = is_due_28day_cycle(d, MONTHLY_CYCLE_ANCHOR),
-           "Monatlich (Phadia, Freitag)"   = is_due_28day_cycle(d, PHADIA_FRIDAY_CYCLE_ANCHOR),
-           "Monatlich (Analyzer, Dienstag)" = is_due_28day_cycle(d, ANALYZER_TUESDAY_CYCLE_ANCHOR),
+           "Monatlich (Freitag, 4-wöchentlich)" = is_due_28day_cycle(d, PHADIA_MONTHLY_ANCHOR),
+           "Monatlich (Dienstag, 4-wöchentlich)" = is_due_28day_cycle(d, ANALYZER_MONTHLY_ANCHOR),
            "Monatlich (Freitag)"           = (wd_en == "Friday" && is_first_workday_of_month(d)),
            "Monatlich oder alle 2500 Proben" = is_due_28day_cycle(d, MONTHLY_CYCLE_ANCHOR),
            "Quartalsweise"                 = is_first_workday_of_quarter(d),
@@ -3847,7 +3862,9 @@ server <- function(input, output, session) {
     "Wöchentlich (Mittwoch, TD)",
     "Wöchentlich (Donnerstag)", "Wöchentlich (Freitag)",
     "Wöchentlich (Freitag, ZL)", "14-tägig",
-    "Monatlich", "Monatlich (Freitag)", "Monatlich oder alle 2500 Proben",
+    "Monatlich", "Monatlich (Freitag, 4-wöchentlich)",
+    "Monatlich (Dienstag, 4-wöchentlich)", "Monatlich (Freitag)",
+    "Monatlich oder alle 2500 Proben",
     "Quartalsweise", "Alle 3 Monate oder alle 7500 Proben",
     "Am ersten Dienstag im Monat", "Am ersten Freitag im Monat",
     "Bei Bedarf", "Wartung bei Bedarf", "Nach jeder Migration:",
@@ -4248,6 +4265,7 @@ server <- function(input, output, session) {
     }
     if (is_admin) {
       items <- c(items, list(
+        menuItem("Alle Aufgaben sehen", tabName = "all_tasks", icon = icon("list-check")),
         menuItem("Neue Aufgabe hinzufügen (Admin)", tabName = "add_task", icon = icon("plus")),
         menuItem("Ungefülltes Wartungsplan herunterladen", tabName = "empty_plan", icon = icon("file-arrow-down")),
         menuItem("Admin", tabName = "admin", icon = icon("user-shield"))
@@ -6262,8 +6280,8 @@ server <- function(input, output, session) {
       if (h %in% c("Wöchentlich", "Wöchentlich (Montag)", "Wöchentlich (Mittwoch)",
                    "Wöchentlich (Mittwoch, TD)", "Wöchentlich (Donnerstag)",
                    "Wöchentlich (Freitag)", "Wöchentlich (Freitag, ZL)",
-                   "Monatlich", "Monatlich (Phadia, Freitag)",
-                   "Monatlich (Analyzer, Dienstag)", "Monatlich (Freitag)",
+                   "Monatlich", "Monatlich (Freitag, 4-wöchentlich)",
+                   "Monatlich (Dienstag, 4-wöchentlich)", "Monatlich (Freitag)",
                    "Monatlich oder alle 2500 Proben",
                    "14-tägig", "Quartalsweise", "Alle 3 Monate oder alle 7500 Proben",
                    "Montag und Donnerstag", "Am ersten Dienstag im Monat",
@@ -6732,8 +6750,8 @@ server <- function(input, output, session) {
           "14-tägig"                        = list("#5e35b1","#7e57c2","#311b92", is_today_biwk_mon),
           "Monatlich"                       = list("#8e24aa","#ba68c8","#4a148c", is_today_monthly_cycle),
           
-          "Monatlich (Phadia, Freitag)"     = list("#8e24aa","#ba68c8","#4a148c",is_due_28day_cycle(Sys.Date(), PHADIA_FRIDAY_CYCLE_ANCHOR)),
-          "Monatlich (Analyzer, Dienstag)"  = list("#8e24aa","#ba68c8","#4a148c",is_due_28day_cycle(Sys.Date(), ANALYZER_TUESDAY_CYCLE_ANCHOR)),
+          "Monatlich (Freitag, 4-wöchentlich)" = list("#8e24aa","#ba68c8","#4a148c", is_due_28day_cycle(Sys.Date(), PHADIA_MONTHLY_ANCHOR)),
+          "Monatlich (Dienstag, 4-wöchentlich)" = list("#8e24aa","#ba68c8","#4a148c", is_due_28day_cycle(Sys.Date(), ANALYZER_MONTHLY_ANCHOR)),
           
           "Monatlich (Freitag)"             = list("#8e24aa","#ba68c8","#4a148c",
                                                    today_day_german == "Freitag" && is_today_workday1),
@@ -6774,8 +6792,8 @@ server <- function(input, output, session) {
         # Compute the next due date for this schedule (if any).
         next_due_date <- switch(hdr,
                                 "Monatlich"                       = next_28day_due(Sys.Date(), MONTHLY_CYCLE_ANCHOR),
-                                "Monatlich (Phadia, Freitag)"     = next_28day_due(Sys.Date(), PHADIA_FRIDAY_CYCLE_ANCHOR),
-                                "Monatlich (Analyzer, Dienstag)"  = next_28day_due(Sys.Date(), ANALYZER_TUESDAY_CYCLE_ANCHOR),
+                                "Monatlich (Freitag, 4-wöchentlich)" = next_28day_due(Sys.Date(), PHADIA_MONTHLY_ANCHOR),
+                                "Monatlich (Dienstag, 4-wöchentlich)" = next_28day_due(Sys.Date(), ANALYZER_MONTHLY_ANCHOR),
                                 "Monatlich oder alle 2500 Proben" = next_28day_due(Sys.Date(), MONTHLY_CYCLE_ANCHOR),
                                 "Am ersten Dienstag im Monat"     = next_28day_due(Sys.Date(), TUESDAY_CYCLE_ANCHOR),
                                 "Am ersten Freitag im Monat"      = next_28day_due(Sys.Date(), FRIDAY_CYCLE_ANCHOR),
@@ -7018,6 +7036,52 @@ server <- function(input, output, session) {
   # truth for recognized schedules, plus "Start-Up" which has no due-date
   # logic of its own but is still a valid admin-assignable section.
   KNOWN_SCHEDULES <- c(SCHEDULE_HEADER_NAMES, "Start-Up")
+  schedule_description <- function(header) {
+    if (is.null(header) || !nzchar(header)) return("")
+    if (header %in% c("Täglich", "Täglich (ZL)", "Täglich (Ablesen zwischen 12:00 und 14:00 Uhr)"))
+      return("Täglich")
+    if (identical(header, "Arbeitstäglich"))
+      return("Arbeitstäglich – Montag bis Freitag")
+    if (header %in% c("Wöchentlich", "Wöchentlich (Montag)"))
+      return("Wöchentlich – Montag")
+    if (header %in% c("Wöchentlich (Mittwoch)", "Wöchentlich (Mittwoch, TD)"))
+      return("Wöchentlich – Mittwoch")
+    if (identical(header, "Wöchentlich (Donnerstag)"))
+      return("Wöchentlich – Donnerstag")
+    if (header %in% c("Wöchentlich (Freitag)", "Wöchentlich (Freitag, ZL)"))
+      return("Wöchentlich – Freitag")
+    if (identical(header, "Montag und Donnerstag"))
+      return("Wöchentlich – Montag und Donnerstag")
+    if (header %in% c("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag"))
+      return(paste("Wöchentlich –", header))
+    if (identical(header, "14-tägig"))
+      return("Alle 2 Wochen – Montag")
+    if (identical(header, "Monatlich"))
+      return("Alle 4 Wochen")
+    if (identical(header, "Monatlich (Freitag, 4-wöchentlich)"))
+      return("Alle 4 Wochen – Freitag")
+    if (identical(header, "Monatlich (Dienstag, 4-wöchentlich)"))
+      return("Alle 4 Wochen – Dienstag")
+    if (identical(header, "Monatlich (Freitag)"))
+      return("Monatlich – Freitag")
+    if (identical(header, "Monatlich oder alle 2500 Proben"))
+      return("Alle 4 Wochen oder alle 2500 Proben")
+    if (identical(header, "Quartalsweise"))
+      return("Alle 3 Monate")
+    if (identical(header, "Alle 3 Monate oder alle 7500 Proben"))
+      return("Alle 3 Monate oder alle 7500 Proben")
+    if (identical(header, "Am ersten Dienstag im Monat"))
+      return("Alle 4 Wochen – Dienstag")
+    if (identical(header, "Am ersten Freitag im Monat"))
+      return("Alle 4 Wochen – Freitag")
+    if (header %in% c("Bei Bedarf", "Wartung bei Bedarf"))
+      return("Bei Bedarf")
+    if (identical(header, "Nach jeder Migration:"))
+      return("Nach jeder Migration")
+    if (identical(header, "Start-Up"))
+      return("Beim Start")
+    header
+  }
   schedule_headers_for_device <- function(con, device_id) {
     df <- tryCatch(load_device_table(con, device_id), error = function(e) NULL)
     if (is.null(df) || !nrow(df)) return(character(0))
@@ -8065,6 +8129,97 @@ server <- function(input, output, session) {
                  "Aufgabenstruktur des gewählten Geräts. Änderungen an Aufgaben ",
                  "(Hinzufügen/Bearbeiten/Löschen) werden automatisch berücksichtigt.")
     )
+  })
+  
+  output$all_tasks_overview <- renderUI({
+    req(rv$authed)
+    if (!identical(rv$role, "admin")) {
+      return(div(class = "alert alert-danger",
+                 "Zugriff verweigert. Nur Administratoren können diese Seite öffnen."))
+    }
+    con <- pg_con(); on.exit(dbDisconnect(con), add = TRUE)
+    devs <- tryCatch(
+      DBI::dbGetQuery(con, "SELECT device_id, label FROM devices ORDER BY device_id"),
+      error = function(e) data.frame(device_id = character(0), label = character(0))
+    )
+    devs <- devs[!(devs$device_id %in% RETIRED_DEVICE_IDS), , drop = FALSE]
+    if (!nrow(devs)) {
+      return(div(class = "alert alert-info", "Keine Geräte gefunden."))
+    }
+    
+    overview_schedule_headers <- c(SCHEDULE_HEADER_NAMES, "Arbeitstäglich")
+    extract_schedule_sections <- function(df) {
+      headers <- if ("Header" %in% names(df)) as.character(df$Header) else character(0)
+      tasks   <- if ("Task" %in% names(df)) as.character(df$Task) else character(length(headers))
+      current_schedule <- ""
+      current_context  <- ""
+      order <- character(0)
+      sections <- list()
+      for (i in seq_along(headers)) {
+        hdr <- headers[i] %||% ""
+        tsk <- tasks[i] %||% ""
+        if (nzchar(hdr)) {
+          if (hdr %in% overview_schedule_headers) {
+            current_schedule <- hdr
+            current_context  <- ""
+            if (!(hdr %in% order)) order <- c(order, hdr)
+            if (is.null(sections[[hdr]])) sections[[hdr]] <- character(0)
+          } else {
+            current_context <- hdr
+          }
+          next
+        }
+        if (!nzchar(tsk) || !nzchar(current_schedule)) next
+        shown_task <- if (nzchar(current_context)) paste0(current_context, ": ", tsk) else tsk
+        sections[[current_schedule]] <- c(sections[[current_schedule]], shown_task)
+      }
+      lapply(order, function(hdr) list(header = hdr, tasks = sections[[hdr]]))
+    }
+    
+    device_sections <- lapply(seq_len(nrow(devs)), function(i) {
+      did <- devs$device_id[i]
+      label <- devs$label[i] %||% ""
+      title <- if (nzchar(label)) paste0(label, " (", did, ")") else did
+      df <- tryCatch(load_device_table(con, did) %||% create_initial_table(did),
+                     error = function(e) create_initial_table(did))
+      scheds <- extract_schedule_sections(df)
+      box(
+        width = 12, title = title, status = "primary", solidHeader = TRUE,
+        if (!length(scheds)) {
+          div(class = "alert alert-info", "Keine Aufgaben definiert.")
+        } else {
+          do.call(tagList, lapply(scheds, function(sec) {
+            tags$div(
+              style = "margin-bottom:16px;",
+              tags$div(
+                style = "font-weight:700; color:#003B73; font-size:15px;",
+                sec$header
+              ),
+              tags$div(
+                style = "font-size:12px; color:#666; margin:2px 0 6px 0;",
+                schedule_description(sec$header)
+              ),
+              tags$ul(
+                style = "margin-bottom:0;",
+                lapply(sec$tasks, tags$li)
+              )
+            )
+          }))
+        }
+      )
+    })
+    
+    do.call(tagList, c(
+      list(
+        tags$div(
+          class = "date-header",
+          style = "background: linear-gradient(135deg, #003B73 0%, #136377 100%);
+                   padding:6px 12px; margin-bottom:10px; font-size:13px;",
+          icon("clipboard-list"), " Alle Aufgaben sehen"
+        )
+      ),
+      device_sections
+    ))
   })
 }
 
